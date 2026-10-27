@@ -301,12 +301,91 @@ def text_encoder_flag(display):
     return "--clip_l"
 
 
+LORA_EXTENSIONS = (".safetensors", ".gguf")
+
+
+def extra_lora_dirs():
+    raw = os.environ.get("SDCPP_LORA_DIRS", os.path.expanduser("~/Downloads"))
+    return [d for d in raw.split(os.pathsep) if d]
+
+
+def lora_roots():
+    roots = []
+    for path in folder_paths.get_folder_paths("loras"):
+        roots.append(("comfy", path))
+    for path in extra_lora_dirs():
+        roots.append((os.path.basename(path.rstrip("/")) or "extra", path))
+    return roots
+
+
+def list_loras():
+    seen = set()
+    names = []
+    for label, root in lora_roots():
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for filename in filenames:
+                if not filename.lower().endswith(LORA_EXTENSIONS):
+                    continue
+                rel = os.path.relpath(os.path.join(dirpath, filename), root)
+                display = f"{label}/{rel}"
+                if display in seen:
+                    continue
+                seen.add(display)
+                names.append(display)
+    return sorted(names)
+
+
+def resolve_lora(display):
+    label, _, rel = display.partition("/")
+    for root_label, root in lora_roots():
+        if root_label != label:
+            continue
+        path = os.path.realpath(os.path.join(root, rel))
+        if not path.startswith(os.path.realpath(root) + os.sep):
+            raise ValueError(f"lora path escapes its root: {display}")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"lora file is gone: {path}")
+        return path
+    raise ValueError(f"unknown lora: {display}")
+
+
 class SDCPPModel:
     """A single file handed to sd.cpp: diffusion model, VAE or text encoder."""
 
     def __init__(self, path, display):
         self.path = path
         self.display = display
+
+
+class SDCPPLora:
+    """A LoRA file plus its strength.
+
+    sd.cpp takes LoRAs the A1111 way: the file lives in --lora-model-dir and
+    the prompt carries `<lora:file_stem:strength>`.
+    """
+
+    def __init__(self, path, strength):
+        self.path = path
+        self.strength = strength
+        self.stem = os.path.splitext(os.path.basename(path))[0]
+
+
+class SDCPPLoraLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "lora": (list_loras(),),
+            "strength": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.05}),
+        }}
+
+    RETURN_TYPES = ("SDCPP_LORA",)
+    FUNCTION = "load"
+    CATEGORY = "sampling/sdcpp"
+
+    def load(self, lora, strength):
+        return (SDCPPLora(resolve_lora(lora), strength),)
 
 
 class SDCPPUnetLoader:
@@ -370,6 +449,9 @@ class SDCPPSampler:
             },
             "optional": {
                 "text_encoder_2": ("SDCPP_MODEL",),
+                "vision_encoder": ("SDCPP_MODEL",),
+                "lora": ("SDCPP_LORA",),
+                "reference_images": ("IMAGE",),
             },
         }
 
@@ -379,7 +461,8 @@ class SDCPPSampler:
 
     def generate(self, diffusion_model, vae, text_encoder, prompt, negative_prompt,
                  width, height, steps, cfg_scale, seed, sampling_method, scheduler,
-                 flow_shift, vae_tiling, text_encoder_2=None):
+                 flow_shift, vae_tiling, text_encoder_2=None, vision_encoder=None,
+                 lora=None, reference_images=None):
         binary = sdcli_path()
         if not os.path.isfile(binary):
             raise FileNotFoundError(
@@ -399,6 +482,12 @@ class SDCPPSampler:
             ]
             for encoder in encoders:
                 cmd += [text_encoder_flag(encoder.display), encoder.path]
+            if vision_encoder is not None:
+                cmd += ["--llm_vision", vision_encoder.path]
+            if lora is not None:
+                cmd += ["--lora-model-dir", os.path.dirname(lora.path)]
+                if "<lora:" not in prompt:
+                    prompt = f"<lora:{lora.stem}:{lora.strength}> {prompt}"
             cmd += [
                 "-p", prompt,
                 "-n", negative_prompt,
@@ -414,6 +503,12 @@ class SDCPPSampler:
                 cmd += ["--flow-shift", str(flow_shift)]
             if vae_tiling:
                 cmd += ["--vae-tiling"]
+            if reference_images is not None:
+                for index, tensor in enumerate(reference_images):
+                    array = (tensor.cpu().numpy() * 255.0).round().astype("uint8")
+                    path = os.path.join(workdir, f"ref_{index}.png")
+                    Image.fromarray(array).save(path)
+                    cmd += ["--ref-image", path]
 
             progress = comfy.utils.ProgressBar(steps)
             lines = []
