@@ -285,9 +285,13 @@ def resolve_model(display, folder_names):
     for root_label, root in model_roots(folder_names):
         if root_label != label:
             continue
-        path = os.path.realpath(os.path.join(root, rel))
-        if not path.startswith(os.path.realpath(root) + os.sep):
+        candidate = os.path.join(root, rel)
+        if not os.path.abspath(candidate).startswith(os.path.abspath(root) + os.sep):
             raise ValueError(f"model path escapes its root: {display}")
+        # The model may be a symlink into the central store, so the real path is
+        # allowed to live outside the root. Only the link itself has to sit
+        # inside it, which keeps ".." out.
+        path = os.path.realpath(candidate)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"model file is gone: {path}")
         return path
