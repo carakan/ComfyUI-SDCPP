@@ -363,11 +363,14 @@ class SDCPPSampler:
                 "steps": ("INT", {"default": 8, "min": 1, "max": 100}),
                 "cfg_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.1}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
-                "sampling_method": (SAMPLING_METHODS, {"default": "res_multistep"}),
-                "scheduler": (SCHEDULERS, {"default": "simple"}),
+                "sampling_method": (SAMPLING_METHODS, {"default": "euler"}),
+                "scheduler": (SCHEDULERS, {"default": "discrete"}),
                 "flow_shift": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 100.0, "step": 0.1}),
                 "vae_tiling": ("BOOLEAN", {"default": True}),
-            }
+            },
+            "optional": {
+                "text_encoder_2": ("SDCPP_MODEL",),
+            },
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -376,12 +379,16 @@ class SDCPPSampler:
 
     def generate(self, diffusion_model, vae, text_encoder, prompt, negative_prompt,
                  width, height, steps, cfg_scale, seed, sampling_method, scheduler,
-                 flow_shift, vae_tiling):
+                 flow_shift, vae_tiling, text_encoder_2=None):
         binary = sdcli_path()
         if not os.path.isfile(binary):
             raise FileNotFoundError(
                 f"sd-cli not found at {binary}. Set SDCPP_BIN to a stable-diffusion.cpp build."
             )
+
+        encoders = [text_encoder]
+        if text_encoder_2 is not None:
+            encoders.append(text_encoder_2)
 
         with tempfile.TemporaryDirectory() as workdir:
             output = os.path.join(workdir, "out.png")
@@ -389,7 +396,10 @@ class SDCPPSampler:
                 binary,
                 "--diffusion-model", diffusion_model.path,
                 "--vae", vae.path,
-                text_encoder_flag(text_encoder.display), text_encoder.path,
+            ]
+            for encoder in encoders:
+                cmd += [text_encoder_flag(encoder.display), encoder.path]
+            cmd += [
                 "-p", prompt,
                 "-n", negative_prompt,
                 "-W", str(width), "-H", str(height),

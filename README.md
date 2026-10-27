@@ -74,23 +74,36 @@ plugin still loads cleanly on platforms where they are unavailable.
    otherwise).
 3. Set prompt, resolution and steps, then **Queue Prompt**.
 
-**Z-Image example** (1024×1024, 8 steps, ~66 s on an RX 6800 XT via Metal):
+**Z-Image example** (896×1152, 8 steps, ~60 s on an RX 6800 XT via Metal):
 
 | node | value |
 |---|---|
 | Diffusion Model | `z_image_turbo-Q4_0.gguf` |
 | VAE | `z_image_ae-f16.gguf` |
 | Text Encoder | `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` |
-| Sampler | `res_multistep`, `simple`, `cfg 1.0`, `flow_shift 3`, `vae_tiling on` |
+| Sampler | `euler`, `discrete`, `cfg 1.0`, `flow_shift -1` (off), `vae_tiling on` |
 
-Notes for Z-Image:
+**Qwen-Image 2.1 example** (needs a Qwen-family LLM text encoder):
 
-- `vae_tiling` **must stay on** for 1024 px: without it the VAE decode leaves
-  a band of garbage across the top of the image. At ≤768 px it makes no
-  difference.
-- `flow_shift 3` matches ComfyUI's `ModelSamplingAuraFlow(shift=3)`.
-- The diffusion model is quantized (`Q4_0`); the base `bf16` safetensors work
-  too but need far more memory.
+| node | value |
+|---|---|
+| Diffusion Model | `qwen_image_2.1-Q6_K.gguf` |
+| VAE | `qwen_image_2.1_vae_bf16.safetensors` |
+| Text Encoder | `Qwen3VL-8B-Instruct-Q4_K_M.gguf` |
+| Sampler | `euler`, `simple`, `cfg 1.0`, `guidance 3.5` (sd.cpp default), `vae_tiling on` |
+
+Notes:
+
+- `vae_tiling` **must stay on**: without it the VAE decode leaves a band of
+  garbage across the top of the image (clearest above 768 px).
+- The text encoder is routed to the right sd.cpp flag by file name: `--llm`
+  for Qwen/Mistral/Llama, `--t5xxl` for T5/UMT5, `--clip_l` otherwise. Models
+  that need two encoders (Qwen-Image 1.x style: T5 **and** CLIP-L) take the
+  second one in the sampler's optional `text_encoder_2` input.
+- `flow_shift` matches ComfyUI's `ModelSamplingAuraFlow(shift=N)`; leave it at
+  `-1` for the distilled turbo checkpoints.
+- The diffusion model can be quantized (`Q4_0`, `Q6_K`); the base `bf16`
+  safetensors work too but need far more memory.
 
 ### Python bindings backend
 
