@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import folder_paths
 import comfy.utils
+import comfy.model_management
 
 # --- stable-diffusion.cpp Python bindings (optional) -------------------------
 # The Flux node below needs the `stable_diffusion_cpp` bindings. They are not
@@ -142,8 +143,7 @@ class SDCppCustomFlux:
         
         # Initialize ComfyUI progress bar and interruption checks
         import time
-        import comfy.model_management
-        
+
         start_time = time.time()
         pbar = comfy.utils.ProgressBar(steps)
         def progress_callback(step: int, steps_total: int, ttime: float):
@@ -411,7 +411,6 @@ class SDCPPSampler:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             while True:
                 try:
-                    import comfy.model_management
                     comfy.model_management.throw_exception_if_processing_interrupted()
                 except Exception:
                     proc.kill()
