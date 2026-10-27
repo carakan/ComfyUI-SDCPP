@@ -446,6 +446,10 @@ class SDCPPSampler:
                 "scheduler": (SCHEDULERS, {"default": "discrete"}),
                 "flow_shift": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 100.0, "step": 0.1}),
                 "vae_tiling": ("BOOLEAN", {"default": True}),
+                "max_vram": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 64.0, "step": 1.0,
+                                       "tooltip": "GPU budget in GiB for model weights. 0 lets sd.cpp "
+                                                  "use all free VRAM; lower it when the big models do not "
+                                                  "fit (Qwen-Image 2.1 needs ~14 GiB on this GPU)."}),
             },
             "optional": {
                 "text_encoder_2": ("SDCPP_MODEL",),
@@ -461,8 +465,8 @@ class SDCPPSampler:
 
     def generate(self, diffusion_model, vae, text_encoder, prompt, negative_prompt,
                  width, height, steps, cfg_scale, seed, sampling_method, scheduler,
-                 flow_shift, vae_tiling, text_encoder_2=None, vision_encoder=None,
-                 lora=None, reference_images=None):
+                 flow_shift, vae_tiling, max_vram=0.0, text_encoder_2=None,
+                 vision_encoder=None, lora=None, reference_images=None):
         binary = sdcli_path()
         if not os.path.isfile(binary):
             raise FileNotFoundError(
@@ -503,6 +507,8 @@ class SDCPPSampler:
                 cmd += ["--flow-shift", str(flow_shift)]
             if vae_tiling:
                 cmd += ["--vae-tiling"]
+            if max_vram > 0:
+                cmd += ["--max-vram", str(max_vram)]
             if reference_images is not None:
                 for index, tensor in enumerate(reference_images):
                     array = (tensor.cpu().numpy() * 255.0).round().astype("uint8")
