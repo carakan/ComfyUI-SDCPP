@@ -450,6 +450,10 @@ class SDCPPSampler:
                                        "tooltip": "GPU budget in GiB for model weights. 0 lets sd.cpp "
                                                   "use all free VRAM; lower it when the big models do not "
                                                   "fit (Qwen-Image 2.1 needs ~14 GiB on this GPU)."}),
+                "offload_to_cpu": ("BOOLEAN", {"default": False,
+                                               "tooltip": "Keep the model weights in RAM and stream them "
+                                                          "to the GPU. Slower, but the 12 GB models fit "
+                                                          "on a GPU shared with everything else."}),
             },
             "optional": {
                 "text_encoder_2": ("SDCPP_MODEL",),
@@ -465,7 +469,7 @@ class SDCPPSampler:
 
     def generate(self, diffusion_model, vae, text_encoder, prompt, negative_prompt,
                  width, height, steps, cfg_scale, seed, sampling_method, scheduler,
-                 flow_shift, vae_tiling, max_vram=0.0, text_encoder_2=None,
+                 flow_shift, vae_tiling, max_vram=0.0, offload_to_cpu=False, text_encoder_2=None,
                  vision_encoder=None, lora=None, reference_images=None):
         binary = sdcli_path()
         if not os.path.isfile(binary):
@@ -509,6 +513,8 @@ class SDCPPSampler:
                 cmd += ["--vae-tiling"]
             if max_vram > 0:
                 cmd += ["--max-vram", str(max_vram)]
+            if offload_to_cpu:
+                cmd += ["--offload-to-cpu"]
             if reference_images is not None:
                 for index, tensor in enumerate(reference_images):
                     array = (tensor.cpu().numpy() * 255.0).round().astype("uint8")
