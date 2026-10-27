@@ -481,6 +481,15 @@ class SDCPPSampler:
         if text_encoder_2 is not None:
             encoders.append(text_encoder_2)
 
+        # sd.cpp takes over the GPU for the whole run. Hand it a clean slate:
+        # torch's caching allocator keeps freed blocks reserved, which on this
+        # 16 GiB card is the difference between the big models fitting and not.
+        try:
+            comfy.model_management.unload_all_models()
+            comfy.model_management.soft_empty_cache(force=True)
+        except Exception as error:
+            print(f"[sd-cli] could not release the torch GPU cache: {error}")
+
         with tempfile.TemporaryDirectory() as workdir:
             output = os.path.join(workdir, "out.png")
             cmd = [
