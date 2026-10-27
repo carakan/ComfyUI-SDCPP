@@ -74,6 +74,16 @@ plugin still loads cleanly on platforms where they are unavailable.
    otherwise).
 3. Set prompt, resolution and steps, then **Queue Prompt**.
 
+Optional sampler inputs:
+
+| input | what it does |
+|---|---|
+| `text_encoder_2` | second encoder for models that need two (Qwen-Image 1.x style: T5 **and** CLIP-L) |
+| `vision_encoder` | the Qwen3-VL vision tower (`mmproj`), needed for reference-image (edit) workflows |
+| `lora` | a LoRA from **`SD.cpp LoRA (sd-cli)`** — see the LoRA section below |
+| `reference_images` | an `IMAGE` batch; each image is passed to sd.cpp as `--ref-image` (image 1 = person, image 2 = outfit, …) |
+| `max_vram` | GPU budget in GiB for the model weights. `0` = use all free VRAM. Lower it (e.g. `8`) when the big models do not fit — Qwen-Image 2.1 wants ~14 GiB and this GPU has 16 GiB shared with everything else |
+
 **Z-Image example** (896×1152, 8 steps, ~60 s on an RX 6800 XT via Metal):
 
 | node | value |
@@ -117,6 +127,53 @@ Inside ComfyUI:
 
 3. Select your UNet, CLIP, and VAE.
 4. Set your prompt, resolution, and steps, then click **Queue Prompt**.
+
+## LoRA
+
+stable-diffusion.cpp supports LoRAs the A1111 way: the weights live in
+`--lora-model-dir` and the prompt carries `<lora:file_stem:strength>`. The
+**`SD.cpp LoRA (sd-cli)`** node does that for you: it adds the directory and
+the tag to the prompt.
+
+Two things bite, and both are silent or fatal rather than obvious:
+
+1. **The key format must be sd.cpp's.** sd.cpp looks a tensor up as
+   `lora.<model tensor name>.lora_down` / `.lora_up`. ComfyUI writes
+   `diffusion_model.<module>.lora_A.weight` / `lora_B.weight`. A ComfyUI
+   LoRA therefore applies **0 of its tensors** — and with
+   `--lora-apply-mode immediately` the process aborts with a native
+   backtrace. Convert the file first:
+
+   ```sh
+   python convert_lora_for_sdcpp.py <in.safetensors> [out.safetensors] [dtype]
+   ```
+
+   The converter renames the keys and casts the weights to f16.
+
+2. **bf16 LoRAs crash the Metal backend.** The precompiled `default.metallib`
+   has no bf16 matmul kernel, so a bf16 LoRA dies with
+   `Function kernel_mul_mm_bf16_f16 was not found in the library`. Cast to f16
+   (the converter does that by default).
+
+With both fixed the LoRA applies: a run with and without the same LoRA differ
+in ~99 % of the pixels. LoRAs are applied at runtime, which costs roughly
+double the time per step.
+
+### Qwen-Image 2.1 outfit swap (edit workflow)
+
+| node | value |
+|---|---|
+| Diffusion Model | `qwen_image_2.1-Q6_K.gguf` |
+| VAE | `qwen_image_2.1_vae_bf16.safetensors` |
+| Text Encoder | `Qwen3VL-8B-Instruct-Q4_K_M.gguf` |
+| Vision Encoder | `mmproj-Qwen3VL-8B-Instruct-F16.gguf` |
+| LoRA | the converted `qwen-image-2.1-outfit-swap.sdcpp.safetensors`, strength 1.0 |
+| Sampler | `euler`, `simple`, `cfg 1.0`, 25 steps, `max_vram 8`, `vae_tiling` on |
+| Prompt | `Dress the person in image 1 in the outfit shown in image 2. Keep their face, hair, hands, pose and the background exactly the same.` |
+
+The two reference images come from two `LoadImage` nodes joined with
+`ImageBatch` into the sampler's `reference_images` input: image 1 is the
+person, image 2 is the outfit.
 
 ## 🔧 Acknowledgements
 Powered by [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) and [ggml](https://github.com/ggerganov/ggml).
