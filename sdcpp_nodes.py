@@ -2,15 +2,27 @@ import torch
 import numpy as np
 import folder_paths
 import comfy.utils
-from stable_diffusion_cpp import StableDiffusion
+
+# --- stable-diffusion.cpp Python bindings (optional) -------------------------
+# The Flux node below needs the `stable_diffusion_cpp` bindings. They are not
+# published for every platform (there is no macOS x86_64 wheel), so the import
+# is optional: when they are missing this module still loads and the sd-cli
+# backend stays usable.
+try:
+    from stable_diffusion_cpp import StableDiffusion
+    HAVE_BINDINGS = True
+except ImportError:
+    StableDiffusion = None
+    HAVE_BINDINGS = False
 
 # --- Apple Silicon Metal Fix ---
 # Force GGML to look inside the stable_diffusion_cpp installation directory
 # for the ggml-metal.metal shader file, otherwise it silently falls back to CPU!
 import os
-import stable_diffusion_cpp
-metal_path = os.path.dirname(stable_diffusion_cpp.__file__)
-os.environ["GGML_METAL_PATH_RESOURCES"] = metal_path
+if HAVE_BINDINGS:
+    import stable_diffusion_cpp
+    metal_path = os.path.dirname(stable_diffusion_cpp.__file__)
+    os.environ["GGML_METAL_PATH_RESOURCES"] = metal_path
 # -------------------------------
 
 # --- THE FIX: Tell ComfyUI to look for .gguf files ---
@@ -68,7 +80,12 @@ class SDCppCustomFlux:
     FUNCTION = "generate"
     CATEGORY = "sampling/sdcpp"
 
-    def generate(self, unet_name, vae_name, clip_name, prompt, width, height, steps, cfg_scale, seed, n_threads):
+    def generate(self, unet_name="", vae_name="", clip_name="", prompt="", width=1024, height=1024, steps=20, cfg_scale=1.0, seed=-1, n_threads=-1):
+        if not HAVE_BINDINGS:
+            raise RuntimeError(
+                "The stable_diffusion_cpp Python bindings are not installed. "
+                "Install them with: pip install stable-diffusion-cpp-python"
+            )
         
         # Resolve the actual file paths on your Mac
         unet_path = folder_paths.get_full_path("unet", unet_name)
@@ -162,3 +179,255 @@ class SDCppCustomFlux:
         img_tensor = torch.from_numpy(img_array).unsqueeze(0).contiguous()
 
         return (img_tensor,)
+
+
+# =============================================================================
+# sd-cli backend
+#
+# The bindings above need a prebuilt `stable_diffusion_cpp` wheel, which does
+# not exist for every platform (macOS x86_64 has none). The nodes below drive a
+# compiled stable-diffusion.cpp `sd-cli` binary instead: no Python bindings, no
+# build step, and it runs the exact build you already have on the machine.
+#
+# The binary is looked up in this order:
+#   1. $SDCPP_BIN
+#   2. /Applications/ToshLLM.app/Contents/Resources/bin-image/sd-cli
+#   3. sd-cli on $PATH
+#
+# Models are searched in ComfyUI's own model folders plus $SDCPP_MODEL_DIRS
+# (default: ~/models/imagen).
+# =============================================================================
+
+import re
+import subprocess
+import tempfile
+
+from PIL import Image
+
+SDCLI_FALLBACK = "/Applications/ToshLLM.app/Contents/Resources/bin-image/sd-cli"
+
+MODEL_EXTENSIONS = (".gguf", ".safetensors", ".sft")
+
+UNET_KEYWORDS = ("z_image", "flux", "qwen_image", "wan", "hunyuan", "sdxl", "juggernaut")
+VAE_KEYWORDS = ("vae", "ae.safetensors", "ae-f16")
+TEXT_ENCODER_KEYWORDS = ("qwen3-4b", "t5", "umt5", "clip", "llm")
+
+SAMPLING_METHODS = [
+    "euler", "euler_a", "heun", "dpm2", "dpm++2s_a", "dpm++2m", "dpm++2mv2",
+    "ipndm", "ipndm_v", "lcm", "ddim_trailing", "tcd", "res_multistep",
+    "res_2s", "er_sde", "euler_cfg_pp", "euler_a_cfg_pp", "euler_ge",
+    "dpm++2m_sde", "dpm++2m_sde_bt", "lms",
+]
+
+SCHEDULERS = [
+    "discrete", "karras", "exponential", "ays", "gits", "sgm_uniform", "simple",
+    "smoothstep", "kl_optimal", "lcm", "bong_tangent", "ltx2", "logit_normal",
+    "flux2", "flux", "beta", "llada_image",
+]
+
+
+def sdcli_path():
+    configured = os.environ.get("SDCPP_BIN")
+    if configured:
+        return configured
+    if os.path.isfile(SDCLI_FALLBACK):
+        return SDCLI_FALLBACK
+    return "sd-cli"
+
+
+def extra_model_dirs():
+    raw = os.environ.get("SDCPP_MODEL_DIRS", os.path.expanduser("~/models/imagen"))
+    return [d for d in raw.split(os.pathsep) if d]
+
+
+def model_roots(folder_names):
+    roots = []
+    for name in folder_names:
+        for path in folder_paths.get_folder_paths(name):
+            roots.append(("comfy", path))
+    for path in extra_model_dirs():
+        roots.append((os.path.basename(path.rstrip("/")) or "extra", path))
+    return roots
+
+
+def list_models(folder_names, role_keywords):
+    """Every model file the node can load.
+
+    The extra model directory is flat and mixes roles, so entries matching the
+    role come first: the combo default is the first item.
+    """
+    seen = set()
+    names = []
+    for label, root in model_roots(folder_names):
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for filename in filenames:
+                if not filename.lower().endswith(MODEL_EXTENSIONS):
+                    continue
+                path = os.path.join(dirpath, filename)
+                rel = os.path.relpath(path, root)
+                display = f"{label}/{rel}"
+                if display in seen:
+                    continue
+                seen.add(display)
+                names.append(display)
+    names.sort(key=lambda name: (0 if any(tag in name.lower() for tag in role_keywords) else 1, name))
+    return names
+
+
+def resolve_model(display, folder_names):
+    """Map a display name back to a path, refusing anything outside the roots."""
+    label, _, rel = display.partition("/")
+    for root_label, root in model_roots(folder_names):
+        if root_label != label:
+            continue
+        path = os.path.realpath(os.path.join(root, rel))
+        if not path.startswith(os.path.realpath(root) + os.sep):
+            raise ValueError(f"model path escapes its root: {display}")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"model file is gone: {path}")
+        return path
+    raise ValueError(f"unknown model: {display}")
+
+
+def text_encoder_flag(display):
+    """sd.cpp takes the text encoder under different flags per family."""
+    name = os.path.basename(display).lower()
+    if any(tag in name for tag in ("qwen", "mistral", "llama")):
+        return "--llm"
+    if any(tag in name for tag in ("t5", "umt5")):
+        return "--t5xxl"
+    return "--clip_l"
+
+
+class SDCPPModel:
+    """A single file handed to sd.cpp: diffusion model, VAE or text encoder."""
+
+    def __init__(self, path, display):
+        self.path = path
+        self.display = display
+
+
+class SDCPPUnetLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"diffusion_model": (list_models(["diffusion_models", "unet"], UNET_KEYWORDS),)}}
+
+    RETURN_TYPES = ("SDCPP_MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "sampling/sdcpp"
+
+    def load(self, diffusion_model):
+        return (SDCPPModel(resolve_model(diffusion_model, ["diffusion_models", "unet"]), diffusion_model),)
+
+
+class SDCPPVaeLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"vae": (list_models(["vae"], VAE_KEYWORDS),)}}
+
+    RETURN_TYPES = ("SDCPP_MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "sampling/sdcpp"
+
+    def load(self, vae):
+        return (SDCPPModel(resolve_model(vae, ["vae"]), vae),)
+
+
+class SDCPPTextEncoderLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"text_encoder": (list_models(["text_encoders", "clip"], TEXT_ENCODER_KEYWORDS),)}}
+
+    RETURN_TYPES = ("SDCPP_MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "sampling/sdcpp"
+
+    def load(self, text_encoder):
+        return (SDCPPModel(resolve_model(text_encoder, ["text_encoders", "clip"]), text_encoder),)
+
+
+class SDCPPSampler:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "diffusion_model": ("SDCPP_MODEL",),
+                "vae": ("SDCPP_MODEL",),
+                "text_encoder": ("SDCPP_MODEL",),
+                "prompt": ("STRING", {"multiline": True, "default": "A highly detailed photograph"}),
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "width": ("INT", {"default": 1024, "min": 64, "max": 2048, "step": 8}),
+                "height": ("INT", {"default": 1024, "min": 64, "max": 2048, "step": 8}),
+                "steps": ("INT", {"default": 8, "min": 1, "max": 100}),
+                "cfg_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.1}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
+                "sampling_method": (SAMPLING_METHODS, {"default": "res_multistep"}),
+                "scheduler": (SCHEDULERS, {"default": "simple"}),
+                "flow_shift": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 100.0, "step": 0.1}),
+                "vae_tiling": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "generate"
+    CATEGORY = "sampling/sdcpp"
+
+    def generate(self, diffusion_model, vae, text_encoder, prompt, negative_prompt,
+                 width, height, steps, cfg_scale, seed, sampling_method, scheduler,
+                 flow_shift, vae_tiling):
+        binary = sdcli_path()
+        if not os.path.isfile(binary):
+            raise FileNotFoundError(
+                f"sd-cli not found at {binary}. Set SDCPP_BIN to a stable-diffusion.cpp build."
+            )
+
+        with tempfile.TemporaryDirectory() as workdir:
+            output = os.path.join(workdir, "out.png")
+            cmd = [
+                binary,
+                "--diffusion-model", diffusion_model.path,
+                "--vae", vae.path,
+                text_encoder_flag(text_encoder.display), text_encoder.path,
+                "-p", prompt,
+                "-n", negative_prompt,
+                "-W", str(width), "-H", str(height),
+                "--steps", str(steps),
+                "--cfg-scale", str(cfg_scale),
+                "--sampling-method", sampling_method,
+                "--scheduler", scheduler,
+                "-s", str(seed),
+                "-o", output,
+            ]
+            if flow_shift >= 0:
+                cmd += ["--flow-shift", str(flow_shift)]
+            if vae_tiling:
+                cmd += ["--vae-tiling"]
+
+            progress = comfy.utils.ProgressBar(steps)
+            lines = []
+            step_re = re.compile(r"\|\s*(\d+)/(\d+)\s*-\s*[\d.]+s/it")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            while True:
+                try:
+                    import comfy.model_management
+                    comfy.model_management.throw_exception_if_processing_interrupted()
+                except Exception:
+                    proc.kill()
+                    raise
+                line = proc.stdout.readline()
+                if line:
+                    lines.append(line.rstrip())
+                    match = step_re.search(line)
+                    if match:
+                        progress.update(int(match.group(1)))
+                    continue
+                if proc.poll() is not None:
+                    break
+            if proc.returncode != 0 or not os.path.isfile(output):
+                raise RuntimeError("sd-cli failed:\n" + "\n".join(lines[-20:]))
+
+            image = Image.open(output).convert("RGB")
+            array = np.asarray(image).astype(np.float32) / 255.0
+            return (torch.from_numpy(array)[None],)
