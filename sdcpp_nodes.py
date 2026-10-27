@@ -209,6 +209,9 @@ SDCLI_FALLBACK = "/Applications/ToshLLM.app/Contents/Resources/bin-image/sd-cli"
 MODEL_EXTENSIONS = (".gguf", ".safetensors", ".sft")
 
 UNET_KEYWORDS = ("z_image", "flux", "qwen_image", "wan", "hunyuan", "sdxl", "juggernaut")
+# Where a diffusion model may live. "checkpoints" lets an SDXL/SD1.5 checkpoint that
+# ComfyUI already loads be reused for sd-cli instead of duplicating the weights.
+UNET_FOLDERS = ["diffusion_models", "unet", "checkpoints"]
 VAE_KEYWORDS = ("vae", "ae.safetensors", "ae-f16")
 TEXT_ENCODER_KEYWORDS = ("qwen3-4b", "t5", "umt5", "clip", "llm")
 
@@ -391,14 +394,18 @@ class SDCPPLoraLoader:
 class SDCPPUnetLoader:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"diffusion_model": (list_models(["diffusion_models", "unet"], UNET_KEYWORDS),)}}
+        # "checkpoints" is included so the SDXL/SD1.5 checkpoints the rest of
+        # ComfyUI already uses can be handed to sd-cli directly. sd.cpp reads a
+        # full SDXL checkpoint as its diffusion model, so there is no reason to
+        # ask for a second copy of the weights.
+        return {"required": {"diffusion_model": (list_models(UNET_FOLDERS, UNET_KEYWORDS),)}}
 
     RETURN_TYPES = ("SDCPP_MODEL",)
     FUNCTION = "load"
     CATEGORY = "sampling/sdcpp"
 
     def load(self, diffusion_model):
-        return (SDCPPModel(resolve_model(diffusion_model, ["diffusion_models", "unet"]), diffusion_model),)
+        return (SDCPPModel(resolve_model(diffusion_model, UNET_FOLDERS), diffusion_model),)
 
 
 class SDCPPVaeLoader:
