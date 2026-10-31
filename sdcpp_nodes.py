@@ -564,6 +564,19 @@ class SDCPPSampler:
     FUNCTION = "generate"
     CATEGORY = "sampling/sdcpp"
 
+    @classmethod
+    def IS_CHANGED(cls, seed, **kwargs):
+        """A random seed must not be served from the cache.
+
+        ComfyUI keys its cache on the node's inputs, so a prompt that always
+        carries the same seed -1 would answer every run with the previous
+        image even though sd-cli picks a new one. Returning NaN makes the
+        signature differ every time, so the node runs again.
+        """
+        if seed < 0:
+            return float("NaN")
+        return seed
+
     def generate(self, diffusion_model, prompt, negative_prompt,
                  width, height, steps, cfg_scale, seed, sampling_method, scheduler,
                  flow_shift, vae_tiling, vae=None, text_encoder=None, max_vram=0.0,
