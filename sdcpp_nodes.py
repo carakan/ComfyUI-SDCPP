@@ -198,7 +198,9 @@ class SDCppCustomFlux:
 # (default: ~/models/imagen).
 # =============================================================================
 
+import json
 import re
+import struct
 import subprocess
 import tempfile
 
@@ -207,6 +209,7 @@ from PIL import Image
 SDCLI_FALLBACK = "/Applications/ToshLLM.app/Contents/Resources/bin-image/sd-cli"
 
 MODEL_EXTENSIONS = (".gguf", ".safetensors", ".sft")
+TOKENIZER_EXTENSIONS = (".json",)
 
 UNET_KEYWORDS = ("z_image", "flux", "qwen_image", "wan", "hunyuan", "sdxl", "juggernaut")
 # Where a diffusion model may live. "checkpoints" lets an SDXL/SD1.5 checkpoint that
@@ -214,6 +217,10 @@ UNET_KEYWORDS = ("z_image", "flux", "qwen_image", "wan", "hunyuan", "sdxl", "jug
 UNET_FOLDERS = ["diffusion_models", "unet", "checkpoints"]
 VAE_KEYWORDS = ("vae", "ae.safetensors", "ae-f16")
 TEXT_ENCODER_KEYWORDS = ("qwen3-4b", "t5", "umt5", "clip", "llm")
+TOKENIZER_KEYWORDS = ("tokenizer",)
+# ComfyUI's own text encoder folder holds the CLIP vocabulary, which sd.cpp
+# cannot use as a tokenizer, so only the extra model directory is searched.
+TOKENIZER_FOLDERS = ["tokenizers"]
 
 SAMPLING_METHODS = [
     "euler", "euler_a", "heun", "dpm2", "dpm++2s_a", "dpm++2m", "dpm++2mv2",
@@ -246,14 +253,20 @@ def extra_model_dirs():
 def model_roots(folder_names):
     roots = []
     for name in folder_names:
-        for path in folder_paths.get_folder_paths(name):
+        try:
+            paths = folder_paths.get_folder_paths(name)
+        except KeyError:
+            # ComfyUI does not know every folder the node looks in, e.g. the
+            # tokenizer folder that only exists in the extra model directory.
+            continue
+        for path in paths:
             roots.append(("comfy", path))
     for path in extra_model_dirs():
         roots.append((os.path.basename(path.rstrip("/")) or "extra", path))
     return roots
 
 
-def list_models(folder_names, role_keywords):
+def list_models(folder_names, role_keywords, extensions=MODEL_EXTENSIONS):
     """Every model file the node can load.
 
     The extra model directory is flat and mixes roles, so entries matching the
@@ -266,9 +279,11 @@ def list_models(folder_names, role_keywords):
             continue
         for dirpath, _dirnames, filenames in os.walk(root):
             for filename in filenames:
-                if not filename.lower().endswith(MODEL_EXTENSIONS):
+                if not filename.lower().endswith(extensions):
                     continue
                 path = os.path.join(dirpath, filename)
+                if not os.path.isfile(path):
+                    continue
                 rel = os.path.relpath(path, root)
                 display = f"{label}/{rel}"
                 if display in seen:
@@ -292,9 +307,8 @@ def resolve_model(display, folder_names):
         # allowed to live outside the root. Only the link itself has to sit
         # inside it, which keeps ".." out.
         path = os.path.realpath(candidate)
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"model file is gone: {path}")
-        return path
+        if os.path.isfile(path):
+            return path
     raise ValueError(f"unknown model: {display}")
 
 
@@ -306,6 +320,26 @@ def text_encoder_flag(display):
     if any(tag in name for tag in ("t5", "umt5")):
         return "--t5xxl"
     return "--clip_l"
+
+
+def is_full_checkpoint(path):
+    """True when a safetensors file bundles its text encoders with the unet.
+
+    SDXL/SD1.5 checkpoints store them under ``conditioner.`` or
+    ``cond_stage_model.``; a split Comfy-Org unet does not. sd.cpp needs
+    --model for the former and --diffusion-model for the latter.
+    """
+    if not path.lower().endswith(".safetensors"):
+        return False
+    try:
+        with open(path, "rb") as handle:
+            size = struct.unpack("<Q", handle.read(8))[0]
+            if size > 64 * 1024 * 1024:
+                return False
+            header = json.loads(handle.read(size))
+    except (OSError, ValueError, struct.error):
+        return False
+    return any(key.startswith(("conditioner.", "cond_stage_model.")) for key in header)
 
 
 LORA_EXTENSIONS = (".safetensors", ".gguf")
@@ -349,9 +383,12 @@ def resolve_lora(display):
     for root_label, root in lora_roots():
         if root_label != label:
             continue
-        path = os.path.realpath(os.path.join(root, rel))
-        if not path.startswith(os.path.realpath(root) + os.sep):
+        candidate = os.path.join(root, rel)
+        if not os.path.abspath(candidate).startswith(os.path.abspath(root) + os.sep):
             raise ValueError(f"lora path escapes its root: {display}")
+        # Like the model loaders, allow a symlink whose target lives in the
+        # central store: only the link itself has to sit inside the root.
+        path = os.path.realpath(candidate)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"lora file is gone: {path}")
         return path
@@ -359,11 +396,17 @@ def resolve_lora(display):
 
 
 class SDCPPModel:
-    """A single file handed to sd.cpp: diffusion model, VAE or text encoder."""
+    """A single file handed to sd.cpp: diffusion model, VAE or text encoder.
 
-    def __init__(self, path, display):
+    ``full_checkpoint`` marks an SDXL/SD1.5 checkpoint that also carries its
+    text encoders and VAE; sd.cpp loads those with --model instead of
+    --diffusion-model plus separate --clip_l/--vae files.
+    """
+
+    def __init__(self, path, display, full_checkpoint=False):
         self.path = path
         self.display = display
+        self.full_checkpoint = full_checkpoint
 
 
 class SDCPPLora:
@@ -409,7 +452,8 @@ class SDCPPUnetLoader:
     CATEGORY = "sampling/sdcpp"
 
     def load(self, diffusion_model):
-        return (SDCPPModel(resolve_model(diffusion_model, UNET_FOLDERS), diffusion_model),)
+        path = resolve_model(diffusion_model, UNET_FOLDERS)
+        return (SDCPPModel(path, diffusion_model, full_checkpoint=is_full_checkpoint(path)),)
 
 
 class SDCPPVaeLoader:
@@ -438,21 +482,45 @@ class SDCPPTextEncoderLoader:
         return (SDCPPModel(resolve_model(text_encoder, ["text_encoders", "clip"]), text_encoder),)
 
 
+class SDCPPTokenizerLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        # sd.cpp wants a tokenizer.json, not the CLIP vocabulary files that
+        # happen to sit in the same folders.
+        candidates = list_models(TOKENIZER_FOLDERS, TOKENIZER_KEYWORDS,
+                                 extensions=TOKENIZER_EXTENSIONS)
+        tokenizers = [name for name in candidates
+                      if os.path.basename(name).lower().startswith("tokenizer")
+                      and not any(part.startswith("clip")
+                                  for part in name.lower().split("/"))]
+        return {"required": {"tokenizer": (tokenizers,)}}
+
+    RETURN_TYPES = ("SDCPP_MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "sampling/sdcpp"
+
+    def load(self, tokenizer):
+        return (SDCPPModel(resolve_model(tokenizer, TOKENIZER_FOLDERS), tokenizer),)
+
+
 class SDCPPSampler:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "diffusion_model": ("SDCPP_MODEL",),
-                "vae": ("SDCPP_MODEL",),
-                "text_encoder": ("SDCPP_MODEL",),
                 "prompt": ("STRING", {"multiline": True, "default": "A highly detailed photograph"}),
                 "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
                 "width": ("INT", {"default": 1024, "min": 64, "max": 2048, "step": 8}),
                 "height": ("INT", {"default": 1024, "min": 64, "max": 2048, "step": 8}),
                 "steps": ("INT", {"default": 8, "min": 1, "max": 100}),
                 "cfg_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.1}),
-                "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
+                # sd-cli parses the seed with std::stoll, which throws on anything
+                # above 2**63-1, so the widget stops there rather than at the
+                # full unsigned 64-bit range.
+                "seed": ("INT", {"default": -1, "min": -1, "max": 0x7fffffffffffffff,
+                                 "tooltip": "The random seed used for creating the noise. "
+                                            "-1 lets sd-cli pick one."}),
                 "sampling_method": (SAMPLING_METHODS, {"default": "euler"}),
                 "scheduler": (SCHEDULERS, {"default": "discrete"}),
                 "flow_shift": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 100.0, "step": 0.1}),
@@ -467,10 +535,28 @@ class SDCPPSampler:
                                                           "on a GPU shared with everything else."}),
             },
             "optional": {
+                # Both are left out when a full checkpoint carries them: sd.cpp
+                # reads those straight from the file passed with --model.
+                "vae": ("SDCPP_MODEL",),
+                "text_encoder": ("SDCPP_MODEL",),
                 "text_encoder_2": ("SDCPP_MODEL",),
+                "tokenizer": ("SDCPP_MODEL",),
                 "vision_encoder": ("SDCPP_MODEL",),
                 "lora": ("SDCPP_LORA",),
                 "reference_images": ("IMAGE",),
+                "input_image": ("IMAGE", {"tooltip": "Denoise starting from this image instead of "
+                                                     "noise (img2img); strength below 1 keeps more of it."}),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "flash_attention": ("BOOLEAN", {"default": False,
+                                                "tooltip": "sd.cpp's flash attention: smaller activations "
+                                                           "and faster sampling on Metal."}),
+                "sigmas": ("STRING", {"default": "",
+                                      "tooltip": "Explicit sigma schedule for distilled models, e.g. the "
+                                                 "Qwen-Image Turbo list. Empty uses the scheduler's own."}),
+                "model_args": ("STRING", {"default": "",
+                                          "tooltip": "Extra model args passed to sd.cpp as --model-args, "
+                                                     "e.g. qwen_image_2_1_prefix_cache_type=q8_0 to shrink "
+                                                     "the Qwen-Image 2.1 prefix cache on small GPUs."}),
             },
         }
 
@@ -478,19 +564,19 @@ class SDCPPSampler:
     FUNCTION = "generate"
     CATEGORY = "sampling/sdcpp"
 
-    def generate(self, diffusion_model, vae, text_encoder, prompt, negative_prompt,
+    def generate(self, diffusion_model, prompt, negative_prompt,
                  width, height, steps, cfg_scale, seed, sampling_method, scheduler,
-                 flow_shift, vae_tiling, max_vram=0.0, offload_to_cpu=False, text_encoder_2=None,
-                 vision_encoder=None, lora=None, reference_images=None):
+                 flow_shift, vae_tiling, vae=None, text_encoder=None, max_vram=0.0,
+                 offload_to_cpu=False, text_encoder_2=None, tokenizer=None, vision_encoder=None, lora=None,
+                 reference_images=None, input_image=None, strength=1.0, flash_attention=False,
+                 sigmas="", model_args=""):
         binary = sdcli_path()
         if not os.path.isfile(binary):
             raise FileNotFoundError(
                 f"sd-cli not found at {binary}. Set SDCPP_BIN to a stable-diffusion.cpp build."
             )
 
-        encoders = [text_encoder]
-        if text_encoder_2 is not None:
-            encoders.append(text_encoder_2)
+        encoders = [encoder for encoder in (text_encoder, text_encoder_2) if encoder is not None]
 
         # sd.cpp takes over the GPU for the whole run. Hand it a clean slate:
         # torch's caching allocator keeps freed blocks reserved, which on this
@@ -503,11 +589,19 @@ class SDCPPSampler:
 
         with tempfile.TemporaryDirectory() as workdir:
             output = os.path.join(workdir, "out.png")
-            cmd = [
-                binary,
-                "--diffusion-model", diffusion_model.path,
-                "--vae", vae.path,
-            ]
+            cmd = [binary]
+            if diffusion_model.full_checkpoint:
+                # The file also holds the text encoders and the VAE, so sd.cpp
+                # loads it whole instead of taking them from separate files.
+                cmd += ["--model", diffusion_model.path]
+            else:
+                cmd += ["--diffusion-model", diffusion_model.path]
+            if vae is not None:
+                cmd += ["--vae", vae.path]
+            if tokenizer is not None:
+                # Qwen3.5 and friends ship their own vocabulary, so the
+                # tokenizer.json has to travel with the text encoder.
+                cmd += ["--tokenizer", tokenizer.path]
             for encoder in encoders:
                 cmd += [text_encoder_flag(encoder.display), encoder.path]
             if vision_encoder is not None:
@@ -524,17 +618,30 @@ class SDCPPSampler:
                 "--cfg-scale", str(cfg_scale),
                 "--sampling-method", sampling_method,
                 "--scheduler", scheduler,
-                "-s", str(seed),
+                "-s", str(max(-1, min(seed, 0x7fffffffffffffff))),
                 "-o", output,
             ]
             if flow_shift >= 0:
                 cmd += ["--flow-shift", str(flow_shift)]
+            if sigmas.strip():
+                # Distilled schedules (Qwen-Image Turbo) are lists of sigmas, not
+                # a scheduler name; sd.cpp takes them verbatim.
+                cmd += ["--sigmas", sigmas.strip()]
+            if model_args.strip():
+                cmd += ["--model-args", model_args.strip()]
             if vae_tiling:
                 cmd += ["--vae-tiling"]
             if max_vram > 0:
                 cmd += ["--max-vram", str(max_vram)]
             if offload_to_cpu:
                 cmd += ["--offload-to-cpu"]
+            if flash_attention:
+                cmd += ["--diffusion-fa"]
+            if input_image is not None:
+                array = (input_image[0].cpu().numpy() * 255.0).round().astype("uint8")
+                input_path = os.path.join(workdir, "input.png")
+                Image.fromarray(array).save(input_path)
+                cmd += ["-i", input_path, "--strength", str(strength)]
             if reference_images is not None:
                 for index, tensor in enumerate(reference_images):
                     array = (tensor.cpu().numpy() * 255.0).round().astype("uint8")
@@ -544,6 +651,7 @@ class SDCPPSampler:
 
             progress = comfy.utils.ProgressBar(steps)
             lines = []
+            print(f"[sd-cli] cmd: {' '.join(cmd)}")
             step_re = re.compile(r"\|\s*(\d+)/(\d+)\s*-\s*[\d.]+s/it")
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             while True:

@@ -4,6 +4,7 @@ from .sdcpp_nodes import (
     SDCPPUnetLoader,
     SDCPPVaeLoader,
     SDCPPTextEncoderLoader,
+    SDCPPTokenizerLoader,
     SDCPPLoraLoader,
     SDCPPSampler,
 )
@@ -12,6 +13,7 @@ NODE_CLASS_MAPPINGS = {
     "SDCPPUnetLoader": SDCPPUnetLoader,
     "SDCPPVaeLoader": SDCPPVaeLoader,
     "SDCPPTextEncoderLoader": SDCPPTextEncoderLoader,
+    "SDCPPTokenizerLoader": SDCPPTokenizerLoader,
     "SDCPPLoraLoader": SDCPPLoraLoader,
     "SDCPPSampler": SDCPPSampler,
 }
@@ -20,6 +22,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SDCPPUnetLoader": "SD.cpp Diffusion Model (sd-cli)",
     "SDCPPVaeLoader": "SD.cpp VAE (sd-cli)",
     "SDCPPTextEncoderLoader": "SD.cpp Text Encoder (sd-cli)",
+    "SDCPPTokenizerLoader": "SD.cpp Tokenizer (sd-cli)",
     "SDCPPLoraLoader": "SD.cpp LoRA (sd-cli)",
     "SDCPPSampler": "SD.cpp Sampler (sd-cli)",
 }
