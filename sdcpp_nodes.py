@@ -679,7 +679,7 @@ class SDCPPSampler:
                     match = step_re.search(line)
                     if match:
                         progress.update(int(match.group(1)))
-                    elif "[INFO" in line or "[WARN" in line or "[ERROR" in line:
+                    elif any(tag in line for tag in ("[I]", "[W]", "[E]", "[INFO", "[WARN", "[ERROR")):
                         print(f"[sd-cli] {line.rstrip()}")
                     continue
                 if proc.poll() is not None:
