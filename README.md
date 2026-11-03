@@ -82,6 +82,7 @@ Optional sampler inputs:
 | `vision_encoder` | the Qwen3-VL vision tower (`mmproj`), needed for reference-image (edit) workflows |
 | `lora` | a LoRA from **`SD.cpp LoRA (sd-cli)`** — see the LoRA section below |
 | `reference_images` | an `IMAGE` batch; each image is passed to sd.cpp as `--ref-image` (image 1 = person, image 2 = outfit, …) |
+| `reference_image_1` / `reference_image_2` / `reference_image_3` | one `IMAGE` each, passed as `--ref-image` in that order. Use these instead of the batch when the references have different dimensions: every image in a batch has to be the same size, separate sockets do not. The numbered sockets come first, then the batch. sd.cpp still wants each reference to be a multiple of 32 in both directions |
 | `max_vram` | GPU budget in GiB for the model weights. `0` = use all free VRAM. Lower it (e.g. `8`) when the big models do not fit — Qwen-Image 2.1 wants ~14 GiB and this GPU has 16 GiB shared with everything else |
 
 **Z-Image example** (896×1152, 8 steps, ~60 s on an RX 6800 XT via Metal):
@@ -171,9 +172,18 @@ double the time per step.
 | Sampler | `euler`, `simple`, `cfg 1.0`, 25 steps, `max_vram 8`, `vae_tiling` on |
 | Prompt | `Dress the person in image 1 in the outfit shown in image 2. Keep their face, hair, hands, pose and the background exactly the same.` |
 
-The two reference images come from two `LoadImage` nodes joined with
-`ImageBatch` into the sampler's `reference_images` input: image 1 is the
-person, image 2 is the outfit.
+The two reference images go into the sampler's `reference_image_1` and
+`reference_image_2` sockets: image 1 is the person, image 2 is the outfit.
+Use the numbered sockets rather than `ImageBatch` whenever the references are
+not the same size — every image in a batch has to share one size, the
+separate sockets do not.
+
+Note that the prompt names the references in words ("image 1", "image 2")
+rather than with `<image1>`/`<image2>` markers. sd.cpp does not substitute a
+marker in the text with the image at that position: it writes its own marker
+in front of every reference and puts the text after them. A prompt that says
+`<image1>` names nothing, and the model falls back to copying whichever
+reference is most prominent.
 
 ## 🔧 Acknowledgements
 Powered by [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) and [ggml](https://github.com/ggerganov/ggml).
