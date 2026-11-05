@@ -84,23 +84,27 @@ Optional sampler inputs:
 | `reference_images` | an `IMAGE` batch; each image is passed to sd.cpp as `--ref-image` (image 1 = person, image 2 = outfit, …) |
 | `reference_image_1` / `reference_image_2` / `reference_image_3` | one `IMAGE` each, passed as `--ref-image` in that order. Use these instead of the batch when the references have different dimensions: every image in a batch has to be the same size, separate sockets do not. The numbered sockets come first, then the batch. sd.cpp still wants each reference to be a multiple of 32 in both directions |
 | `max_vram` | GPU budget in GiB for the model weights. `0` = use all free VRAM. Lower it (e.g. `8`) when the big models do not fit — Qwen-Image 2.1 wants ~14 GiB and this GPU has 16 GiB shared with everything else |
-| `randomize_prompt` | keep one option of every `{a\|b\|c}` group in the positive prompt, picked at random — see below |
+| `randomize_prompt` | keep one option of every `{a\|b\|c}` group in the positive prompt, picked at random — on by default, see below |
 
 ### Randomizing parts of the prompt
 
-Turn on `randomize_prompt` and write alternatives in braces in the positive
-prompt: `a woman wearing a {red|blue|white} top`. Every group keeps one
-option, and each run picks another one.
+Write alternatives in braces in the positive prompt: `a woman wearing a
+{red|blue|white} top`. Every group keeps one option, and each run picks
+another one. `randomize_prompt` is **on by default** (like ComfyUI core's
+dynamic prompts); switch it off to send the braces to the model literally.
 
 - Nested groups work: `{red|{blue|white}}`.
 - A fixed `seed` keeps the pick reproducible — the same seed always chooses the
   same option. `seed -1` (sd-cli picks the noise seed itself) gives a new
   option on every run.
 - The expanded prompt is printed to the log (`[sd-cli] randomized prompt: …`) so
-  you can see which option was used.
+  you can see which option was used. Nothing is printed when the prompt has no
+  group.
 - With **ComfyUI-Impact-Pack** installed its expander is used, which also
   understands weights (`{5::red|1::blue}`) and wildcard files (`__colours__`).
   Without that pack a plain `{a|b|c}` expander is used instead.
+- The prompt reaches the engine with the braces already resolved, so sd.cpp's
+  own weighting syntax (`(text:1.5)`) still applies on top of it.
 
 **Z-Image example** (896×1152, 8 steps, ~60 s on an RX 6800 XT via Metal):
 

@@ -649,11 +649,12 @@ class SDCPPSampler:
                                           "tooltip": "Extra model args passed to sd.cpp as --model-args, "
                                                      "e.g. qwen_image_2_1_prefix_cache_type=q8_0 to shrink "
                                                      "the Qwen-Image 2.1 prefix cache on small GPUs."}),
-                "randomize_prompt": ("BOOLEAN", {"default": False,
+                "randomize_prompt": ("BOOLEAN", {"default": True,
                                                 "tooltip": "Keep one option of every {a|b|c} group in the "
                                                            "positive prompt, picked at random. A fixed seed "
                                                            "keeps the pick reproducible, seed -1 gives a new "
-                                                           "one on every run."}),
+                                                           "one on every run. Turn it off to send the braces "
+                                                           "to the model literally."}),
             },
         }
 
@@ -680,12 +681,14 @@ class SDCPPSampler:
                  offload_to_cpu=False, text_encoder_2=None, tokenizer=None, vision_encoder=None, lora=None,
                  reference_images=None, input_image=None, strength=1.0, flash_attention=False,
                  reference_image_1=None, reference_image_2=None, reference_image_3=None,
-                 sigmas="", model_args="", randomize_prompt=False):
+                 sigmas="", model_args="", randomize_prompt=True):
         if randomize_prompt:
             # A fixed seed keeps the choice reproducible, seed -1 (sd-cli picks
             # the noise seed itself) gets a new one on every run.
-            prompt = expand_prompt_groups(prompt, seed if seed >= 0 else None)
-            print(f"[sd-cli] randomized prompt: {prompt}")
+            expanded = expand_prompt_groups(prompt, seed if seed >= 0 else None)
+            if expanded != prompt:
+                print(f"[sd-cli] randomized prompt: {expanded}")
+                prompt = expanded
 
         binary = sdcli_path()
         if not os.path.isfile(binary):
