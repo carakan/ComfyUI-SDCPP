@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import random
 import folder_paths
 import comfy.utils
 import comfy.model_management
@@ -44,6 +45,93 @@ if hasattr(folder_paths, "filename_list_cache"):
 if hasattr(folder_paths, "cache_helper") and hasattr(folder_paths.cache_helper, "clear"):
     folder_paths.cache_helper.clear()
 # -----------------------------------------------------
+
+# --- prompt randomization ---------------------------------------------------
+def _split_group(content):
+    """Split the body of a brace group on the pipes outside nested groups."""
+    parts = []
+    depth = 0
+    current = ""
+    for char in content:
+        if char == "{":
+            depth += 1
+            current += char
+        elif char == "}":
+            depth -= 1
+            current += char
+        elif char == "|" and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += char
+    parts.append(current)
+    return parts
+
+
+def _expand_groups(text, rng):
+    """Keep one alternative of every {a|b|c} group in `text`.
+
+    Nested groups work: {red|{blue|white}} picks red, blue or white. A group
+    with a single option loses its braces, and a brace that never closes is
+    left alone.
+    """
+    out = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == "{":
+            depth = 0
+            end = index
+            while end < length:
+                if text[end] == "{":
+                    depth += 1
+                elif text[end] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                end += 1
+            if end >= length:
+                out.append(text[index:])
+                break
+            chosen = rng.choice(_split_group(text[index + 1:end]))
+            out.append(_expand_groups(chosen, rng))
+            index = end + 1
+        else:
+            out.append(char)
+            index += 1
+    return "".join(out)
+
+
+def randomize_prompt_groups(text, seed=None):
+    """Local brace expander, used when ComfyUI-Impact-Pack is not installed."""
+    rng = random.Random(seed) if seed is not None else random.Random()
+    return _expand_groups(text, rng)
+
+
+_wildcard_expander = None
+
+
+def expand_prompt_groups(text, seed=None):
+    """Keep one option of every {a|b|c} group in `text`.
+
+    ComfyUI-Impact-Pack ships a seeded expander that also understands weights
+    ({5::red|1::blue}) and wildcard files, so it is used when that pack is
+    installed. The local expander keeps this node working without it.
+    """
+    global _wildcard_expander
+    if _wildcard_expander is None:
+        try:
+            # Imported here, not at module scope: custom node packs are loaded
+            # in filesystem order, so Impact Pack may not have put its modules
+            # directory on sys.path yet.
+            from impact.wildcards import process
+            _wildcard_expander = process
+        except ImportError:
+            _wildcard_expander = randomize_prompt_groups
+    return _wildcard_expander(text, seed)
+# -----------------------------------------------------------------------------
+
 
 class SDCppCustomFlux:
     def __init__(self):
@@ -561,6 +649,11 @@ class SDCPPSampler:
                                           "tooltip": "Extra model args passed to sd.cpp as --model-args, "
                                                      "e.g. qwen_image_2_1_prefix_cache_type=q8_0 to shrink "
                                                      "the Qwen-Image 2.1 prefix cache on small GPUs."}),
+                "randomize_prompt": ("BOOLEAN", {"default": False,
+                                                "tooltip": "Keep one option of every {a|b|c} group in the "
+                                                           "positive prompt, picked at random. A fixed seed "
+                                                           "keeps the pick reproducible, seed -1 gives a new "
+                                                           "one on every run."}),
             },
         }
 
@@ -587,7 +680,13 @@ class SDCPPSampler:
                  offload_to_cpu=False, text_encoder_2=None, tokenizer=None, vision_encoder=None, lora=None,
                  reference_images=None, input_image=None, strength=1.0, flash_attention=False,
                  reference_image_1=None, reference_image_2=None, reference_image_3=None,
-                 sigmas="", model_args=""):
+                 sigmas="", model_args="", randomize_prompt=False):
+        if randomize_prompt:
+            # A fixed seed keeps the choice reproducible, seed -1 (sd-cli picks
+            # the noise seed itself) gets a new one on every run.
+            prompt = expand_prompt_groups(prompt, seed if seed >= 0 else None)
+            print(f"[sd-cli] randomized prompt: {prompt}")
+
         binary = sdcli_path()
         if not os.path.isfile(binary):
             raise FileNotFoundError(
