@@ -291,8 +291,33 @@ import re
 import struct
 import subprocess
 import tempfile
+import threading
+import time
 
 from PIL import Image
+
+# Only one sd-cli may run at a time. Every render spawns its own process, and a
+# cancel can abandon one mid-run; without this guard the next queued render
+# starts a second sd-cli on top of it, and every abandoned one keeps holding
+# the GPU until the machine gives up. The lock serializes renders, and the
+# handle below lets a new render put down a leftover process first.
+_sdcli_lock = threading.Lock()
+_sdcli_process = None
+
+
+def _sdcli_stop(process, grace=15.0):
+    """Shut a running sd-cli down, politely first, then hard."""
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        try:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=grace)
+    except OSError:
+        pass
 
 SDCLI_FALLBACK = "/Applications/ToshLLM.app/Contents/Resources/bin-image/sd-cli"
 
@@ -790,26 +815,44 @@ class SDCPPSampler:
             lines = []
             print(f"[sd-cli] cmd: {' '.join(cmd)}")
             step_re = re.compile(r"\|\s*(\d+)/(\d+)\s*-\s*[\d.]+s/it")
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            while True:
+
+            global _sdcli_process
+            # One render at a time, for the whole life of the process. ComfyUI
+            # aborts a cancelled prompt and immediately starts the next queued
+            # one; without the lock that next render launches a second sd-cli
+            # on top of the abandoned one.
+            with _sdcli_lock:
+                # A cancel that arrived while the previous render was winding
+                # down must not launch a fresh one.
+                comfy.model_management.throw_exception_if_processing_interrupted()
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                _sdcli_process = proc
                 try:
-                    comfy.model_management.throw_exception_if_processing_interrupted()
-                except Exception:
-                    proc.kill()
-                    raise
-                line = proc.stdout.readline()
-                if line:
-                    lines.append(line.rstrip())
-                    match = step_re.search(line)
-                    if match:
-                        progress.update(int(match.group(1)))
-                    elif any(tag in line for tag in ("[I]", "[W]", "[E]", "[INFO", "[WARN", "[ERROR")):
-                        print(f"[sd-cli] {line.rstrip()}")
-                    continue
-                if proc.poll() is not None:
-                    break
-            if proc.returncode != 0 or not os.path.isfile(output):
-                raise RuntimeError("sd-cli failed:\n" + "\n".join(lines[-20:]))
+                    while True:
+                        # InterruptProcessingException inherits from BaseException,
+                        # so it escapes `except Exception` guards - the finally
+                        # below is the only thing that stops sd-cli on a cancel.
+                        comfy.model_management.throw_exception_if_processing_interrupted()
+                        line = proc.stdout.readline()
+                        if line:
+                            lines.append(line.rstrip())
+                            match = step_re.search(line)
+                            if match:
+                                progress.update(int(match.group(1)))
+                            elif any(tag in line for tag in ("[I]", "[W]", "[E]", "[INFO", "[WARN", "[ERROR")):
+                                print(f"[sd-cli] {line.rstrip()}")
+                            continue
+                        if proc.poll() is not None:
+                            break
+                        time.sleep(0.05)
+                finally:
+                    # Cancel, failure, executor shutdown: sd-cli never outlives
+                    # its render. terminate first so Metal can clean up, kill if
+                    # it ignores that.
+                    _sdcli_stop(proc)
+                    _sdcli_process = None
+                if proc.returncode != 0 or not os.path.isfile(output):
+                    raise RuntimeError("sd-cli failed:\n" + "\n".join(lines[-20:]))
 
             image = Image.open(output).convert("RGB")
             array = np.asarray(image).astype(np.float32) / 255.0

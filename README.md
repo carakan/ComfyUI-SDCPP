@@ -74,6 +74,12 @@ plugin still loads cleanly on platforms where they are unavailable.
    otherwise).
 3. Set prompt, resolution and steps, then **Queue Prompt**.
 
+Each render runs its own `sd-cli` process, but only one at a time: a render
+waits for the previous one to fully exit before it launches, and **Cancel**
+stops the running `sd-cli` (SIGTERM first, SIGKILL if it ignores that) before
+the prompt is aborted, so a cancelled render never leaves the engine holding
+the GPU underneath the next queued one.
+
 Optional sampler inputs:
 
 | input | what it does |
