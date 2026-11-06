@@ -1,61 +1,93 @@
 # ComfyUI-SDCPP
 
-A custom node for **ComfyUI** that integrates the powerful [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) inference engine. This node brings high-performance, `gguf` quantized model support to ComfyUI, with massive optimization specifically for Apple Silicon (Metal) devices to efficiently run huge models like Flux!
+A custom node for **ComfyUI** that integrates the [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) inference engine: quantized `gguf` models inside ComfyUI, driven by an `sd-cli` binary you already have working on the machine. The plugin is backend-agnostic — it never talks to the GPU itself, the engine does, so it runs on Metal, Vulkan, CUDA, SYCL or CPU, whichever backend your binary was built with.
 
 ## 🌟 Features
 
 - **Two backends, one plugin**:
-  - **Python bindings** (upstream): `SD.cpp Flux (UNet/VAE/CLIP)` drives the
-    `stable_diffusion_cpp` bindings in-process.
-  - **sd-cli** (added in this fork): `SD.cpp Sampler (sd-cli)` drives an
-    already-compiled `stable-diffusion.cpp` binary as a subprocess. No
-    bindings, no build step, and it runs *your* build — the one you already
-    have working on the machine.
-- **GGUF Support In ComfyUI**: Automatically patches ComfyUI's model loaders to recognize `.gguf` extensions. You can effortlessly load `unet`, `vae`, and `clip` files in GGUF format!
-- **Apple Silicon / Metal Optimization**: 
-  - Forces GGML to correctly locate the `ggml-metal.metal` shader files, preventing silent CPU fallbacks.
-  - Implements `enable_mmap` and `offload_params_to_cpu` for native zero-copy streaming directly from ssd to Unified Memory. Massively reduces swapping out RAM, preventing OOMs (Out Of Memory) entirely.
-- **Flash Attention**: Greatly speeds up generation and reduces VRAM/RAM load footprint.
-- **ComfyUI Compatibility**: Fully integrates with ComfyUI's step progress bar, interruption triggers (Cancel button), and robustly translates the output directly into perfectly contiguous standard `IMAGE` tensors, seamlessly compatible with downstream ComfyUI PyTorch nodes.
-- **Model families beyond Flux**: the sd-cli backend handles whatever your
-  binary supports — Flux, SD1.5/SDXL, Wan, Qwen-Image and **Z-Image**.
+  - **sd-cli**: **`SD.cpp Sampler (sd-cli)`** drives an already-compiled
+    `stable-diffusion.cpp` binary as a subprocess. No bindings, no build step,
+    and it runs *your* build — the one that already works on this machine, on
+    any backend.
+  - **Python bindings** (upstream): **`SD.cpp Flux (UNet/VAE/CLIP)`** drives
+    the `stable_diffusion_cpp` bindings in-process.
+- **GGUF support in ComfyUI**: the plugin adds `.gguf` to the extensions
+  ComfyUI accepts for `unet`, `clip` and `vae` folders, so GGUF files show up
+  in the dropdowns next to the safetensors ones.
+- **One engine process at a time**: every render spawns its own `sd-cli`, but
+  a render waits for the previous one to fully exit before it launches, and
+  **Cancel** stops the running engine before the prompt is aborted. A
+  cancelled render can never leave a stale engine holding the GPU under the
+  next queued one.
+- **Flash Attention**: sd.cpp's `--flash-attn` shrinks the activation
+  footprint and speeds sampling up.
+- **ComfyUI integration**: step progress bar, working Cancel, and a plain
+  `IMAGE` tensor out — ready for any downstream ComfyUI node.
+- **Model families**: the sd-cli backend handles whatever your binary
+  supports — Flux, SD1.5/SDXL, Wan, Qwen-Image 1.x/2.1, Z-Image, Hunyuan and
+  friends.
 
 ## 📦 Installation
 
 ### sd-cli backend (no Python dependencies)
 
-1. Make sure a `stable-diffusion.cpp` `sd-cli` binary exists and works on
-   your machine.
-2. Tell the node where it is (optional — the defaults are tried first):
+1. Get a working `stable-diffusion.cpp` `sd-cli` binary for your platform and
+   tell the node where it is:
    ```bash
    export SDCPP_BIN=/path/to/sd-cli
    ```
    Lookup order: `$SDCPP_BIN` →
    `/Applications/ToshLLM.app/Contents/Resources/bin-image/sd-cli` → `sd-cli`
    on `$PATH`.
-3. Optionally add a directory of extra models (default `~/models/imagen`):
+2. Optionally add model directories (default `~/models/imagen`), separated by
+   the platform path separator (`:` on macOS/Linux, `;` on Windows):
    ```bash
    export SDCPP_MODEL_DIRS=/path/to/models:/other/models
    ```
-4. Clone the plugin:
+3. Clone the plugin:
    ```bash
    cd ComfyUI/custom_nodes
    git clone https://github.com/carakan/ComfyUI-SDCPP.git
    ```
-5. Boot up ComfyUI. The node registers `SD.cpp Diffusion Model (sd-cli)`,
+4. Boot up ComfyUI. The node registers `SD.cpp Diffusion Model (sd-cli)`,
    `SD.cpp VAE (sd-cli)`, `SD.cpp Text Encoder (sd-cli)` and
    `SD.cpp Sampler (sd-cli)`.
 
-### Python bindings backend (Apple Silicon)
+The env vars are read by the server process, so a change needs a ComfyUI
+restart. A wrong `SDCPP_BIN` fails fast with
+`FileNotFoundError: sd-cli not found at ...`.
 
-1. Ensure your Python environment has the `stable_diffusion_cpp` bindings installed:
+### macOS on Intel, engine from ToshLLM
+
+The machine this plugin was developed on is an Intel Mac with an AMD RX 6800
+XT: ComfyUI runs there on a custom PyTorch MPS build, and the engine is the
+Metal `sd-cli` shipped inside the ToshLLM app build — no Apple Silicon
+anywhere. `ComfyUI/start_comfyui.sh` wires it up:
+
+```bash
+export SDCPP_BIN="$HOME/development/toshllm/dist/ToshLLM.app/Contents/Resources/bin-image/sd-cli"
+export SDCPP_MODEL_DIRS="$HOME/models/imagen"
+```
+
+The launcher only fills a value that is not already set, so exporting these
+before starting it overrides it. Things worth knowing on that setup:
+
+- ComfyUI runs the *dist* build, not the copy installed under
+  `/Applications` — that one is refreshed by hand and drifts behind. Which
+  binary ran is logged as `[sd-cli] cmd:` on every render.
+- On the 16 GiB card, set the sampler's `max_vram` to `8` for the big models
+  (Qwen-Image 2.1) instead of the `0` = use-everything default; a full canvas
+  otherwise fails weight preparation and returns flat noise.
+
+### Python bindings backend
+
+1. Install the bindings:
    ```bash
    pip install stable-diffusion-cpp-python
    ```
-   There is **no macOS x86_64 wheel** — on that platform the bindings have to
-   be built from source, and the sd-cli backend above is the way to go.
-2. Clone the plugin as shown above.
-3. Boot up ComfyUI.
+   There is no macOS x86_64 wheel — on Intel Macs the bindings must be built
+   from source, and the sd-cli backend above is the way to go.
+2. Clone the plugin as shown above and boot ComfyUI.
 
 The Flux node is only registered when the bindings import successfully, so the
 plugin still loads cleanly on platforms where they are unavailable.
@@ -89,7 +121,7 @@ Optional sampler inputs:
 | `lora` | a LoRA from **`SD.cpp LoRA (sd-cli)`** — see the LoRA section below |
 | `reference_images` | an `IMAGE` batch; each image is passed to sd.cpp as `--ref-image` (image 1 = person, image 2 = outfit, …) |
 | `reference_image_1` / `reference_image_2` / `reference_image_3` | one `IMAGE` each, passed as `--ref-image` in that order. Use these instead of the batch when the references have different dimensions: every image in a batch has to be the same size, separate sockets do not. The numbered sockets come first, then the batch. sd.cpp still wants each reference to be a multiple of 32 in both directions |
-| `max_vram` | GPU budget in GiB for the model weights. `0` = use all free VRAM. Lower it (e.g. `8`) when the big models do not fit — Qwen-Image 2.1 wants ~14 GiB and this GPU has 16 GiB shared with everything else |
+| `max_vram` | GPU budget in GiB for the model weights. `0` = use all free VRAM. Lower it (e.g. `8`) when the big models do not fit |
 | `randomize_prompt` | keep one option of every `{a\|b\|c}` group in the positive prompt, picked at random — on by default, see below |
 
 ### Randomizing parts of the prompt
@@ -112,7 +144,8 @@ dynamic prompts); switch it off to send the braces to the model literally.
 - The prompt reaches the engine with the braces already resolved, so sd.cpp's
   own weighting syntax (`(text:1.5)`) still applies on top of it.
 
-**Z-Image example** (896×1152, 8 steps, ~60 s on an RX 6800 XT via Metal):
+**Z-Image example** (896×1152, 8 steps, ~60 s measured on an Intel Mac with an
+AMD RX 6800 XT, Metal backend):
 
 | node | value |
 |---|---|
@@ -163,27 +196,22 @@ stable-diffusion.cpp supports LoRAs the A1111 way: the weights live in
 **`SD.cpp LoRA (sd-cli)`** node does that for you: it adds the directory and
 the tag to the prompt.
 
-Two things bite, and both are silent or fatal rather than obvious:
+**The key format must be sd.cpp's.** sd.cpp looks a tensor up as
+`lora.<model tensor name>.lora_down` / `.lora_up`. ComfyUI writes
+`diffusion_model.<module>.lora_A.weight` / `lora_B.weight`. A ComfyUI LoRA
+therefore applies **0 of its tensors** — and with
+`--lora-apply-mode immediately` the process aborts with a native backtrace.
+Convert the file first:
 
-1. **The key format must be sd.cpp's.** sd.cpp looks a tensor up as
-   `lora.<model tensor name>.lora_down` / `.lora_up`. ComfyUI writes
-   `diffusion_model.<module>.lora_A.weight` / `lora_B.weight`. A ComfyUI
-   LoRA therefore applies **0 of its tensors** — and with
-   `--lora-apply-mode immediately` the process aborts with a native
-   backtrace. Convert the file first:
+```sh
+python convert_lora_for_sdcpp.py <in.safetensors> [out.safetensors] [dtype]
+```
 
-   ```sh
-   python convert_lora_for_sdcpp.py <in.safetensors> [out.safetensors] [dtype]
-   ```
+The converter renames the keys and casts the weights to f16. f16 is the
+default because it is small and every backend has a fast f16 path; bf16 LoRAs
+work too on current engine builds, so pass `bf16` as the dtype to keep it.
 
-   The converter renames the keys and casts the weights to f16.
-
-2. **bf16 LoRAs crash the Metal backend.** The precompiled `default.metallib`
-   has no bf16 matmul kernel, so a bf16 LoRA dies with
-   `Function kernel_mul_mm_bf16_f16 was not found in the library`. Cast to f16
-   (the converter does that by default).
-
-With both fixed the LoRA applies: a run with and without the same LoRA differ
+After conversion the LoRA applies: a run with and without the same LoRA differ
 in ~99 % of the pixels. LoRAs are applied at runtime, which costs roughly
 double the time per step.
 

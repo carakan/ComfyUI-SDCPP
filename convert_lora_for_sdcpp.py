@@ -23,10 +23,9 @@ Usage:
 Without an output path the result is written next to the input as
 <name>.sdcpp.safetensors. Tensor data is copied verbatim, only the keys change.
 
-The dtype argument (default f16) casts the LoRA weights. ai-toolkit writes
-bf16, and the precompiled Metal library shipped with the sd.cpp build has no
-bf16 matmul kernel — the run dies with "Function kernel_mul_mm_bf16_f16 was
-not found in the library". f16 keeps the build's fast path.
+The dtype argument (default f16) casts the LoRA weights. f16 is small and
+every backend has a fast f16 path; bf16 also works on current engine builds,
+so pass bf16 to keep the adapter's dtype.
 """
 import json
 import os
