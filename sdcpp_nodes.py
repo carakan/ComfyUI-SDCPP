@@ -670,7 +670,6 @@ class SDCPPSampler:
                 "tokenizer": ("SDCPP_MODEL",),
                 "vision_encoder": ("SDCPP_MODEL",),
                 "lora": ("SDCPP_LORA",),
-                "reference_images": ("IMAGE",),
                 "reference_image_1": ("IMAGE", {"tooltip": "First reference image. "
                                                             "sd.cpp takes one --ref-image per image, in order."}),
                 "reference_image_2": ("IMAGE", {"tooltip": "Second reference image."}),
@@ -718,7 +717,7 @@ class SDCPPSampler:
                  width, height, steps, cfg_scale, seed, sampling_method, scheduler,
                  flow_shift, vae_tiling, vae=None, text_encoder=None, max_vram=0.0,
                  offload_to_cpu=False, text_encoder_2=None, tokenizer=None, vision_encoder=None, lora=None,
-                 reference_images=None, input_image=None, strength=1.0, flash_attention=False,
+                 input_image=None, strength=1.0, flash_attention=False,
                  reference_image_1=None, reference_image_2=None, reference_image_3=None,
                  sigmas="", model_args="", randomize_prompt=True):
         if randomize_prompt:
@@ -801,21 +800,14 @@ class SDCPPSampler:
                 input_path = os.path.join(workdir, "input.png")
                 Image.fromarray(array).save(input_path)
                 cmd += ["-i", input_path, "--strength", str(strength)]
-            if reference_images is not None or any(image is not None for image in
-                                                  (reference_image_1, reference_image_2, reference_image_3)):
-                # The numbered sockets come first, in order, then the batch.
-                # They are separate tensors, so unlike the batch they do not
-                # have to share their dimensions - a portrait and a landscape
-                # reference can go in side by side. sd.cpp still wants each of
-                # them to be a multiple of 32 in both directions.
-                #
-                # Every input is a batch of images, so each image in it is one
-                # reference: the numbered sockets usually hold one image, the
-                # batch socket holds as many as it was given.
+            if any(image is not None for image in
+                   (reference_image_1, reference_image_2, reference_image_3)):
+                # Separate tensors, so the numbered references do not have to
+                # share their dimensions - a portrait and a landscape reference
+                # can go in side by side. sd.cpp still wants each of them to be
+                # a multiple of 32 in both directions.
                 groups = [image for image in (reference_image_1, reference_image_2, reference_image_3)
                           if image is not None]
-                if reference_images is not None:
-                    groups.append(reference_images)
                 index = 0
                 for group in groups:
                     for tensor in group:

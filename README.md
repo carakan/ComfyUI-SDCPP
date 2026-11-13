@@ -123,8 +123,7 @@ Optional sampler inputs:
 | `text_encoder_2` | second encoder for models that need two (Qwen-Image 1.x style: T5 **and** CLIP-L) |
 | `vision_encoder` | the Qwen3-VL vision tower (`mmproj`), needed for reference-image (edit) workflows |
 | `lora` | a LoRA from **`SD.cpp LoRA (sd-cli)`** — see the LoRA section below |
-| `reference_images` | an `IMAGE` batch; each image is passed to sd.cpp as `--ref-image` (image 1 = person, image 2 = outfit, …) |
-| `reference_image_1` / `reference_image_2` / `reference_image_3` | one `IMAGE` each, passed as `--ref-image` in that order. Use these instead of the batch when the references have different dimensions: every image in a batch has to be the same size, separate sockets do not. The numbered sockets come first, then the batch. sd.cpp still wants each reference to be a multiple of 32 in both directions |
+| `reference_image_1` / `reference_image_2` / `reference_image_3` | one `IMAGE` each, passed as `--ref-image` in that order. Separate sockets, so the references do not have to share one size. sd.cpp still wants each reference to be a multiple of 32 in both directions |
 | `max_vram` | GPU budget in GiB for the model weights. `0` = use all free VRAM. Lower it (e.g. `8`) when the big models do not fit |
 | `randomize_prompt` | keep one option of every `{a\|b\|c}` group in the positive prompt, picked at random — on by default, see below |
 
@@ -233,9 +232,8 @@ double the time per step.
 
 The two reference images go into the sampler's `reference_image_1` and
 `reference_image_2` sockets: image 1 is the person, image 2 is the outfit.
-Use the numbered sockets rather than `ImageBatch` whenever the references are
-not the same size — every image in a batch has to share one size, the
-separate sockets do not.
+Separate sockets, so the references do not have to share one size — every
+image in a batch would.
 
 Note that the prompt names the references in words ("image 1", "image 2")
 rather than with `<image1>`/`<image2>` markers. sd.cpp does not substitute a
