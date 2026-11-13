@@ -687,12 +687,6 @@ class SDCPPSampler:
                 "flash_attention": ("BOOLEAN", {"default": False,
                                                 "tooltip": "sd.cpp's flash attention: smaller activations "
                                                            "and faster sampling on Metal."}),
-                "text_encoder_cpu": ("BOOLEAN", {"default": True,
-                                                 "tooltip": "Run the text encoder on the CPU "
-                                                            "(--params-backend te=cpu): it never sits in "
-                                                            "VRAM, leaving more of the card to the "
-                                                            "diffusion model and LoRAs. Slower prompt "
-                                                            "encoding."}),
                 "sigmas": ("STRING", {"default": "",
                                       "tooltip": "Explicit sigma schedule for distilled models, e.g. the "
                                                  "Qwen-Image Turbo list. Empty uses the scheduler's own."}),
@@ -706,6 +700,15 @@ class SDCPPSampler:
                                                            "keeps the pick reproducible, seed -1 gives a new "
                                                            "one on every run. Turn it off to send the braces "
                                                            "to the model literally."}),
+                # New widgets must be appended at the END of this dict: saved
+                # workflows map widget values positionally, so inserting one
+                # earlier shifts every later value into the wrong widget.
+                "text_encoder_cpu": ("BOOLEAN", {"default": True,
+                                                 "tooltip": "Run the text encoder on the CPU "
+                                                            "(--params-backend te=cpu): it never sits in "
+                                                            "VRAM, leaving more of the card to the "
+                                                            "diffusion model and LoRAs. Slower prompt "
+                                                            "encoding."}),
             },
         }
 
