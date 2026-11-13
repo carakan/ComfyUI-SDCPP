@@ -287,9 +287,11 @@ class SDCppCustomFlux:
 # =============================================================================
 
 import json
+import platform
 import re
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -356,6 +358,18 @@ def sdcli_path():
     if os.path.isfile(SDCLI_FALLBACK):
         return SDCLI_FALLBACK
     return "sd-cli"
+
+def sdcli_env():
+    """Env for the sd-cli subprocess.
+
+    The ToshLLM engine build gates its AMD Metal flash-attention kernels
+    behind TOSH_FA_AMD=1. Only a macOS Intel machine runs that build.
+    """
+    env = dict(os.environ)
+    if (sys.platform == "darwin" and platform.machine() == "x86_64"
+            and "toshllm" in sdcli_path().lower()):
+        env["TOSH_FA_AMD"] = "1"
+    return env
 
 
 def extra_model_dirs():
@@ -825,7 +839,8 @@ class SDCPPSampler:
                 # A cancel that arrived while the previous render was winding
                 # down must not launch a fresh one.
                 comfy.model_management.throw_exception_if_processing_interrupted()
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                        env=sdcli_env())
                 _sdcli_process = proc
                 try:
                     while True:

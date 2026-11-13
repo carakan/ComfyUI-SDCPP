@@ -78,6 +78,10 @@ before starting it overrides it. Things worth knowing on that setup:
 - On the 16 GiB card, set the sampler's `max_vram` to `8` for the big models
   (Qwen-Image 2.1) instead of the `0` = use-everything default; a full canvas
   otherwise fails weight preparation and returns flat noise.
+- On macOS Intel with the ToshLLM binary, the plugin exports `TOSH_FA_AMD=1`
+  to every `sd-cli` call — that build gates its AMD Metal flash-attention
+  kernels behind the variable. Nothing to configure; point `SDCPP_BIN`
+  elsewhere and it stays unset.
 
 ### Python bindings backend
 
