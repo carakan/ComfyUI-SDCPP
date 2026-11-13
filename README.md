@@ -78,10 +78,14 @@ before starting it overrides it. Things worth knowing on that setup:
 - On the 16 GiB card, set the sampler's `max_vram` to `8` for the big models
   (Qwen-Image 2.1) instead of the `0` = use-everything default; a full canvas
   otherwise fails weight preparation and returns flat noise.
-- On macOS Intel with the ToshLLM binary, the plugin exports `TOSH_FA_AMD=1`
-  to every `sd-cli` call — that build gates its AMD Metal flash-attention
-  kernels behind the variable. Nothing to configure; point `SDCPP_BIN`
-  elsewhere and it stays unset.
+- On macOS Intel with the ToshLLM binary, the plugin exports the enhanced
+  environment on every `sd-cli` call:
+  ```bash
+  export TOSH_FA_AMD=1          # flash attention routes to the _amd kernels
+  export TOSH_MM_WIDE_DISABLE=1 # wide matmul tile is LLM-tuned; costs on diffusion
+  export GGML_METAL_NCB=3       # Metal command-buffer split under the GPU watchdog
+  ```
+  Nothing to configure; point `SDCPP_BIN` elsewhere and it stays unset.
 
 ### Python bindings backend
 
@@ -125,6 +129,8 @@ Optional sampler inputs:
 | `lora` | a LoRA from **`SD.cpp LoRA (sd-cli)`** — see the LoRA section below |
 | `reference_image_1` / `reference_image_2` / `reference_image_3` | one `IMAGE` each, passed as `--ref-image` in that order. Separate sockets, so the references do not have to share one size. sd.cpp still wants each reference to be a multiple of 32 in both directions |
 | `max_vram` | GPU budget in GiB for the model weights. `0` = use all free VRAM. Lower it (e.g. `8`) when the big models do not fit |
+| `flash_attention` | sd.cpp flash attention on the diffusion pass (`--flash-attn off,diffusion=on`) |
+| `text_encoder_cpu` | run the text encoder on the CPU (`--params-backend te=cpu`, default on): it never sits in VRAM, leaving more of the card to the diffusion model and LoRAs, at the cost of slower prompt encoding |
 | `randomize_prompt` | keep one option of every `{a\|b\|c}` group in the positive prompt, picked at random — on by default, see below |
 
 ### Randomizing parts of the prompt

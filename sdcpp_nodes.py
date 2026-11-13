@@ -362,13 +362,20 @@ def sdcli_path():
 def sdcli_env():
     """Env for the sd-cli subprocess.
 
-    The ToshLLM engine build gates its AMD Metal flash-attention kernels
-    behind TOSH_FA_AMD=1. Only a macOS Intel machine runs that build.
+    The ToshLLM engine build on macOS Intel (AMD over Metal):
+    - TOSH_FA_AMD=1 routes flash attention to the _amd kernels - essential
+      when --flash-attn is on.
+    - TOSH_MM_WIDE_DISABLE=1 turns off the wide matmul tile; it is LLM-tuned
+      and costs on diffusion.
+    - GGML_METAL_NCB=3 splits Metal command buffers so big canvases stay
+      under the GPU watchdog.
     """
     env = dict(os.environ)
     if (sys.platform == "darwin" and platform.machine() == "x86_64"
             and "toshllm" in sdcli_path().lower()):
         env["TOSH_FA_AMD"] = "1"
+        env["TOSH_MM_WIDE_DISABLE"] = "1"
+        env["GGML_METAL_NCB"] = "3"
     return env
 
 
@@ -680,6 +687,12 @@ class SDCPPSampler:
                 "flash_attention": ("BOOLEAN", {"default": False,
                                                 "tooltip": "sd.cpp's flash attention: smaller activations "
                                                            "and faster sampling on Metal."}),
+                "text_encoder_cpu": ("BOOLEAN", {"default": True,
+                                                 "tooltip": "Run the text encoder on the CPU "
+                                                            "(--params-backend te=cpu): it never sits in "
+                                                            "VRAM, leaving more of the card to the "
+                                                            "diffusion model and LoRAs. Slower prompt "
+                                                            "encoding."}),
                 "sigmas": ("STRING", {"default": "",
                                       "tooltip": "Explicit sigma schedule for distilled models, e.g. the "
                                                  "Qwen-Image Turbo list. Empty uses the scheduler's own."}),
@@ -717,7 +730,7 @@ class SDCPPSampler:
                  width, height, steps, cfg_scale, seed, sampling_method, scheduler,
                  flow_shift, vae_tiling, vae=None, text_encoder=None, max_vram=0.0,
                  offload_to_cpu=False, text_encoder_2=None, tokenizer=None, vision_encoder=None, lora=None,
-                 input_image=None, strength=1.0, flash_attention=False,
+                 input_image=None, strength=1.0, flash_attention=False, text_encoder_cpu=True,
                  reference_image_1=None, reference_image_2=None, reference_image_3=None,
                  sigmas="", model_args="", randomize_prompt=True):
         if randomize_prompt:
@@ -794,7 +807,11 @@ class SDCPPSampler:
             if offload_to_cpu:
                 cmd += ["--offload-to-cpu"]
             if flash_attention:
-                cmd += ["--diffusion-fa"]
+                cmd += ["--flash-attn", "off,diffusion=on"]
+            if text_encoder_cpu:
+                # Encode on the CPU: the encoder never sits in VRAM, leaving
+                # more of the card to the diffusion model and LoRAs.
+                cmd += ["--params-backend", "te=cpu"]
             if input_image is not None:
                 array = (input_image[0].cpu().numpy() * 255.0).round().astype("uint8")
                 input_path = os.path.join(workdir, "input.png")
