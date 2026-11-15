@@ -287,6 +287,7 @@ class SDCppCustomFlux:
 # =============================================================================
 
 import json
+import io
 import platform
 import re
 import struct
@@ -377,6 +378,370 @@ def sdcli_env():
         env["TOSH_MM_WIDE_DISABLE"] = "1"
         env["GGML_METAL_NCB"] = "3"
     return env
+
+
+# =============================================================================
+# sd-server backend
+#
+# The spawn path above pays for a fresh process, a fresh Metal init and a
+# fresh weight load on every render. The server backend keeps one sd-server
+# process alive and renders through its native async API, so the model stays
+# resident and the second render of a workflow starts sampling right away.
+#
+# The mode is a process environment switch, read once at import:
+#
+#   SDCPP_MODE=standalone   spawn sd-cli per render (default, unchanged)
+#   SDCPP_MODE=server       keep one sd-server alive and render through it
+#
+# Other knobs (all optional):
+#   SDCPP_SERVER_BIN        path to sd-server (default: next to $SDCPP_BIN)
+#   SDCPP_SERVER_HOST       default 127.0.0.1
+#   SDCPP_SERVER_PORT       default 12727 (upstream's own default is 1234)
+#   SDCPP_SERVER_IDLE_MINUTES  unload the model after this many idle minutes
+#                            (default 10; 0 disables the idle unload)
+#   SDCPP_SERVER_CONDITIONING_CACHE  prompt cache size (default 8)
+#
+# A resident server holds VRAM, so the model is unloaded once the machine goes
+# idle: the process stays up (no restart cost) but the card is free again.
+#
+# The plugin never depends on the server: if it cannot be started, or a
+# request fails, the render falls back to the spawn path.
+# =============================================================================
+
+import base64
+import urllib.error
+import urllib.request
+
+SDSERVER_FALLBACK = "/Applications/ToshLLM.app/Contents/Resources/bin-image/sd-server"
+
+_server = None
+
+
+def server_mode_enabled():
+    """True when SDCPP_MODE asks for the long-running server path."""
+    return os.environ.get("SDCPP_MODE", "standalone").strip().lower() == "server"
+
+
+def sdserver_path():
+    configured = os.environ.get("SDCPP_SERVER_BIN")
+    if configured:
+        return configured
+    sibling = os.path.join(os.path.dirname(sdcli_path()), "sd-server")
+    if os.path.isfile(sibling):
+        return sibling
+    if os.path.isfile(SDSERVER_FALLBACK):
+        return SDSERVER_FALLBACK
+    return "sd-server"
+
+
+def server_endpoint():
+    host = os.environ.get("SDCPP_SERVER_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port = int(os.environ.get("SDCPP_SERVER_PORT", "12727"))
+    return host, port
+
+
+def server_idle_minutes():
+    try:
+        return float(os.environ.get("SDCPP_SERVER_IDLE_MINUTES", "10"))
+    except ValueError:
+        return 10.0
+
+
+class SDServer:
+    """One sd-server process, driven through its native async API."""
+
+    def __init__(self):
+        self.process = None
+        self.context_key = None
+        self.last_used = 0.0
+        self.lock = threading.RLock()
+        self.idle_thread = None
+        self.log_handle = None
+        self.log_path = None
+
+    # -- process -----------------------------------------------------------
+    def alive(self):
+        return self.process is not None and self.process.poll() is None
+
+    def _log(self, message):
+        print(f"[sd-server] {message}")
+
+    def _http(self, method, path, body=None, timeout=30):
+        host, port = server_endpoint()
+        url = f"http://{host}:{port}{path}"
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        request = urllib.request.Request(url, data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            return response.status, (json.loads(raw) if raw else {})
+
+    def stop(self):
+        with self.lock:
+            if self.process is None:
+                return
+            self._log("stopping the server")
+            _sdcli_stop(self.process)
+            self.process = None
+            self.context_key = None
+            if getattr(self, "log_handle", None) is not None:
+                try:
+                    self.log_handle.close()
+                except OSError:
+                    pass
+                self.log_handle = None
+
+    def _start(self, context_args, env):
+        binary = sdserver_path()
+        if not os.path.isfile(binary):
+            raise FileNotFoundError(
+                f"sd-server not found at {binary}. Set SDCPP_SERVER_BIN to a stable-diffusion.cpp server build."
+            )
+        host, port = server_endpoint()
+        cmd = [
+            binary,
+            "--listen-ip", host,
+            "--listen-port", str(port),
+            "--log-level", os.environ.get("SDCPP_SERVER_LOG_LEVEL", "warn"),
+            "--conditioning-cache-size", os.environ.get("SDCPP_SERVER_CONDITIONING_CACHE", "8"),
+        ]
+        cmd += context_args
+        self._log(f"starting: {' '.join(cmd)}")
+        # The server writes its own progress and timings. A pipe nobody reads
+        # fills up and blocks the server, so the output goes to a file.
+        self.log_path = os.path.join(tempfile.gettempdir(), "sdcpp-sd-server.log")
+        self.log_handle = open(self.log_path, "w")
+        self.process = subprocess.Popen(cmd, stdout=self.log_handle, stderr=subprocess.STDOUT,
+                                        text=True, env=env)
+        self._wait_ready()
+        self._start_idle_watch()
+
+    def _wait_ready(self, timeout=600):
+        """Wait until the server has the model loaded and answers."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.process is not None and self.process.poll() is not None:
+                raise RuntimeError("sd-server exited while loading the model")
+            try:
+                status, payload = self._http("GET", "/sdcpp/v1/models/status", timeout=10)
+                if status == 200 and payload.get("state") == "ready":
+                    self._log("model loaded")
+                    return
+                if payload.get("error"):
+                    raise RuntimeError(f"the server could not load the model: {payload['error']}")
+            except urllib.error.HTTPError:
+                pass
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+            time.sleep(1.0)
+        raise RuntimeError("sd-server did not load the model in time")
+
+    def ensure(self, context_args, env):
+        """Reuse the server when the model context matches, else restart it."""
+        with self.lock:
+            key = " ".join(context_args)
+            if self.alive() and self.context_key == key:
+                self.last_used = time.time()
+                return
+            self.stop()
+            self.context_key = key
+            self._start(context_args, env)
+            self.last_used = time.time()
+
+    # -- idle handling -----------------------------------------------------
+    def _start_idle_watch(self):
+        if self.idle_thread is not None:
+            return
+
+        def watch():
+            while True:
+                time.sleep(30)
+                try:
+                    minutes = server_idle_minutes()
+                    if minutes <= 0 or not self.alive():
+                        continue
+                    if time.time() - self.last_used < minutes * 60:
+                        continue
+                    self._log("idle: unloading the model to give the VRAM back")
+                    try:
+                        self._http("POST", "/sdcpp/v1/models/unload", {}, timeout=30)
+                    except Exception as error:
+                        self._log(f"idle unload failed: {error}")
+                    self.last_used = time.time()
+                except Exception:
+                    continue
+
+        self.idle_thread = threading.Thread(target=watch, daemon=True)
+        self.idle_thread.start()
+
+    # -- render ------------------------------------------------------------
+    def render(self, body, steps, timeout=3600):
+        """Submit a generation, poll it, and return the images as PIL objects."""
+        status, payload = self._http("POST", "/sdcpp/v1/img_gen", body, timeout=120)
+        if status not in (200, 202):
+            raise RuntimeError(f"sd-server refused the request: {status} {payload}")
+        job_id = payload.get("id")
+        if not job_id:
+            raise RuntimeError(f"sd-server returned no job id: {payload}")
+
+        progress = comfy.utils.ProgressBar(steps)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            status, job = self._http("GET", f"/sdcpp/v1/jobs/{job_id}", timeout=30)
+            state = job.get("status")
+            job_progress = job.get("progress") or {}
+            total = job_progress.get("total")
+            if total:
+                progress.update(int(job_progress.get("completed") or 0))
+            if state == "completed":
+                break
+            if state in ("failed", "cancelled"):
+                error = job.get("error") or {}
+                raise RuntimeError(f"sd-server job {state}: {error.get('message') or error}")
+            time.sleep(0.4)
+        else:
+            raise RuntimeError("sd-server job did not finish in time")
+
+        images = (job.get("result") or {}).get("images") or []
+        if not images:
+            raise RuntimeError("sd-server returned no image")
+        out = []
+        for entry in images:
+            encoded = entry.get("b64_json")
+            if not encoded:
+                continue
+            out.append(Image.open(io.BytesIO(base64.b64decode(encoded))))
+        if not out:
+            raise RuntimeError("sd-server returned an image without data")
+        return out
+
+
+def get_server():
+    global _server
+    if _server is None:
+        _server = SDServer()
+    return _server
+
+
+LORA_TAG_RE = re.compile(r"<lora:([^:>]+)(?::([^:>]+))?>")
+
+
+def split_lora_tags(prompt):
+    """Pull the A1111 style LoRA tags out of a prompt.
+
+    The server API does not read them: a LoRA travels as a structured field.
+    Returns the clean prompt and the list of (name, multiplier) pairs.
+    """
+    loras = []
+
+    def take(match):
+        name = match.group(1).strip()
+        try:
+            multiplier = float(match.group(2)) if match.group(2) else 1.0
+        except ValueError:
+            multiplier = 1.0
+        loras.append((name, multiplier))
+        return ""
+
+    return LORA_TAG_RE.sub(take, prompt).strip(), loras
+
+
+def parse_sigma_list(sigmas):
+    """The sigma schedule as numbers, or None when it is a preset name.
+
+    The server takes the schedule as an array of floats; a preset name like
+    `minimax-h3-image` has no server side equivalent, so the caller falls
+    back to the spawn path.
+    """
+    values = []
+    for part in sigmas.replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            values.append(float(part))
+        except ValueError:
+            return None
+    return values or None
+
+
+def model_context_args(diffusion_model, vae, tokenizer, encoders, vision_encoder, lora):
+    """The model context flags, shared by the spawn path and the server start."""
+    args = []
+    if diffusion_model.full_checkpoint:
+        # The file also holds the text encoders and the VAE, so sd.cpp
+        # loads it whole instead of taking them from separate files.
+        args += ["--model", diffusion_model.path]
+    else:
+        args += ["--diffusion-model", diffusion_model.path]
+    if vae is not None:
+        args += ["--vae", vae.path]
+    if tokenizer is not None:
+        # Qwen3.5 and friends ship their own vocabulary, so the
+        # tokenizer.json has to travel with the text encoder.
+        args += ["--tokenizer", tokenizer.path]
+    for encoder in encoders:
+        args += [text_encoder_flag(encoder.display), encoder.path]
+    if vision_encoder is not None:
+        args += ["--llm_vision", vision_encoder.path]
+    if lora is not None:
+        args += ["--lora-model-dir", os.path.dirname(lora.path)]
+    return args
+
+
+def server_request(prompt, negative_prompt, width, height, steps, cfg_scale, seed,
+                   sampling_method, scheduler, flow_shift, sigmas, strength,
+                   vae_tiling, lora, prompt_loras, workdir, input_image, reference_images):
+    """The native img_gen body for one render."""
+    body = {
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "width": width,
+        "height": height,
+        "seed": max(-1, min(seed, 0x7FFFFFFFFFFFFFFF)),
+        "strength": strength,
+        "output_format": "png",
+        "sample_params": {
+            "sample_steps": steps,
+            "sample_method": sampling_method,
+            "scheduler": scheduler,
+            "guidance": {"txt_cfg": cfg_scale},
+        },
+    }
+    if flow_shift >= 0:
+        body["sample_params"]["flow_shift"] = flow_shift
+    if sigmas.strip():
+        values = parse_sigma_list(sigmas)
+        if values is None:
+            raise RuntimeError(
+                f"the server needs the sigma schedule as numbers, not the preset {sigmas.strip()!r}"
+            )
+        body["sample_params"]["custom_sigmas"] = values
+    entries = []
+    if lora is not None:
+        entries.append({"path": lora.stem, "multiplier": lora.strength})
+    for name, multiplier in prompt_loras:
+        entries.append({"path": name, "multiplier": multiplier})
+    if entries:
+        body["lora"] = entries
+    if vae_tiling:
+        body["vae_tiling_params"] = {"enabled": True}
+    if input_image is not None:
+        array = (input_image[0].cpu().numpy() * 255.0).round().astype("uint8")
+        path = os.path.join(workdir, "input.png")
+        Image.fromarray(array).save(path)
+        body["init_image"] = path
+    if reference_images:
+        paths = []
+        for index, tensor in enumerate(reference_images):
+            array = (tensor.cpu().numpy() * 255.0).round().astype("uint8")
+            path = os.path.join(workdir, f"ref_{index}.png")
+            Image.fromarray(array).save(path)
+            paths.append(path)
+        body["ref_images"] = paths
+    return body
 
 
 def extra_model_dirs():
@@ -729,6 +1094,34 @@ class SDCPPSampler:
             return float("NaN")
         return seed
 
+    def _render_with_server(self, context_args, prompt, negative_prompt, width, height,
+                            steps, cfg_scale, seed, sampling_method, scheduler, flow_shift,
+                            sigmas, strength, vae_tiling, lora, input_image,
+                            reference_image_1, reference_image_2, reference_image_3):
+        """Render through the resident sd-server process.
+
+        The server keeps the model loaded, so the second render of a workflow
+        skips the spawn, the Metal init and the weight load.
+        """
+        server = get_server()
+        clean_prompt, prompt_loras = split_lora_tags(prompt)
+        references = []
+        for group in (reference_image_1, reference_image_2, reference_image_3):
+            if group is not None:
+                references.extend(group)
+
+        with _sdcli_lock:
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            server.ensure(context_args, sdcli_env())
+            with tempfile.TemporaryDirectory() as workdir:
+                body = server_request(clean_prompt, negative_prompt, width, height, steps,
+                                      cfg_scale, seed, sampling_method, scheduler, flow_shift,
+                                      sigmas, strength, vae_tiling, lora, prompt_loras,
+                                      workdir, input_image, references)
+                images = server.render(body, steps)
+            array = np.asarray(images[0].convert("RGB")).astype(np.float32) / 255.0
+            return (torch.from_numpy(array)[None],)
+
     def generate(self, diffusion_model, prompt, negative_prompt,
                  width, height, steps, cfg_scale, seed, sampling_method, scheduler,
                  flow_shift, vae_tiling, vae=None, text_encoder=None, max_vram=0.0,
@@ -752,38 +1145,45 @@ class SDCPPSampler:
 
         encoders = [encoder for encoder in (text_encoder, text_encoder_2) if encoder is not None]
 
+        # The model context is the same for both paths: the flags that say
+        # which model, VAE, encoders and LoRA folder this render uses.
+        context_args = model_context_args(diffusion_model, vae, tokenizer, encoders,
+                                          vision_encoder, lora)
+
         # sd.cpp takes over the GPU for the whole run. Hand it a clean slate:
         # torch's caching allocator keeps freed blocks reserved, which on this
         # 16 GiB card is the difference between the big models fitting and not.
         try:
+            import gc
+            gc.collect()
             comfy.model_management.unload_all_models()
             comfy.model_management.soft_empty_cache(force=True)
+            if torch.backends.mps.is_available():
+                # sd-cli can only use what the driver still shows free; these two
+                # numbers say whether ComfyUI itself is the process holding it.
+                print(f"[sd-cli] MPS after release: tensors {torch.mps.current_allocated_memory() / 2**20:.0f} MB, driver {torch.mps.driver_allocated_memory() / 2**20:.0f} MB")
         except Exception as error:
             print(f"[sd-cli] could not release the torch GPU cache: {error}")
+
+        if server_mode_enabled():
+            try:
+                return self._render_with_server(context_args, prompt, negative_prompt,
+                                                width, height, steps, cfg_scale, seed,
+                                                sampling_method, scheduler, flow_shift,
+                                                sigmas, strength, vae_tiling, lora,
+                                                input_image, reference_image_1,
+                                                reference_image_2, reference_image_3)
+            except Exception as error:
+                # The server is an optimisation, never a dependency: any
+                # failure goes back to the spawn path.
+                print(f"[sd-server] server path failed, falling back to sd-cli: {error}")
 
         with tempfile.TemporaryDirectory() as workdir:
             output = os.path.join(workdir, "out.png")
             cmd = [binary]
-            if diffusion_model.full_checkpoint:
-                # The file also holds the text encoders and the VAE, so sd.cpp
-                # loads it whole instead of taking them from separate files.
-                cmd += ["--model", diffusion_model.path]
-            else:
-                cmd += ["--diffusion-model", diffusion_model.path]
-            if vae is not None:
-                cmd += ["--vae", vae.path]
-            if tokenizer is not None:
-                # Qwen3.5 and friends ship their own vocabulary, so the
-                # tokenizer.json has to travel with the text encoder.
-                cmd += ["--tokenizer", tokenizer.path]
-            for encoder in encoders:
-                cmd += [text_encoder_flag(encoder.display), encoder.path]
-            if vision_encoder is not None:
-                cmd += ["--llm_vision", vision_encoder.path]
-            if lora is not None:
-                cmd += ["--lora-model-dir", os.path.dirname(lora.path)]
-                if "<lora:" not in prompt:
-                    prompt = f"<lora:{lora.stem}:{lora.strength}> {prompt}"
+            cmd += context_args
+            if lora is not None and "<lora:" not in prompt:
+                prompt = f"<lora:{lora.stem}:{lora.strength}> {prompt}"
             cmd += [
                 "-p", prompt,
                 "-n", negative_prompt,

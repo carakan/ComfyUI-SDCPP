@@ -133,6 +133,53 @@ Optional sampler inputs:
 | `text_encoder_cpu` | run the text encoder on the CPU (`--params-backend te=cpu`, default on): it never sits in VRAM, leaving more of the card to the diffusion model and LoRAs, at the cost of slower prompt encoding |
 | `randomize_prompt` | keep one option of every `{a\|b\|c}` group in the positive prompt, picked at random — on by default, see below |
 
+### Server mode (one resident engine instead of a process per render)
+
+The spawn path pays for a new process, a new Metal init and a new weight load
+on every render. In **server mode** the node keeps one `sd-server` process
+alive and renders through its native async API, so the model stays loaded and
+the second render of a workflow starts sampling right away.
+
+The mode is a process environment switch:
+
+| variable | default | meaning |
+|---|---|---|
+| `SDCPP_MODE` | `server` | `server` keeps one `sd-server` alive, `standalone` spawns `sd-cli` per render |
+| `SDCPP_SERVER_BIN` | next to `$SDCPP_BIN` | the `sd-server` binary |
+| `SDCPP_SERVER_HOST` | `127.0.0.1` | where the server listens |
+| `SDCPP_SERVER_PORT` | `12727` | the port (upstream's own default, 1234, is left free) |
+| `SDCPP_SERVER_IDLE_MINUTES` | `10` | unload the model after this many idle minutes; the process stays up, the VRAM goes back. `0` keeps the model resident |
+| `SDCPP_SERVER_CONDITIONING_CACHE` | `8` | prompt cache size for repeat prompts |
+| `SDCPP_SERVER_LOG_LEVEL` | `warn` | the server's own log level |
+
+```sh
+SDCPP_MODE=server ./start_comfyui.sh      # resident engine (the default now)
+SDCPP_MODE=standalone ./start_comfyui.sh  # one sd-cli per render
+```
+
+What the node does in server mode:
+
+1. starts `sd-server` with the workflow's model context (the same
+   `--diffusion-model`, `--vae`, `--llm`, `--lora-model-dir` flags the spawn
+   path would use) and waits until it reports `state: ready`;
+2. posts the render to `/sdcpp/v1/img_gen` and polls `/sdcpp/v1/jobs/{id}`;
+3. decodes the returned image and hands it to ComfyUI.
+
+Differences worth knowing:
+
+- **LoRA travels as data, not as a tag.** The server does not read
+  `<lora:file:strength>` inside the prompt, so the node strips those tags and
+  sends them as the structured `lora` field instead.
+- **Sigma presets do not exist on the server.** The schedule has to be a list
+  of numbers. A preset name (`minimax-h3-image`) sends that workflow back to
+  the spawn path.
+- **The plugin never depends on the server.** If it cannot be started, or a
+  request fails, the render falls back to the spawn path and still completes.
+
+A resident server holds VRAM, so the model is unloaded once the machine goes
+idle (`SDCPP_SERVER_IDLE_MINUTES`); the process stays up, the card is free
+again, and the next render reloads the model.
+
 ### Randomizing parts of the prompt
 
 Write alternatives in braces in the positive prompt: `a woman wearing a
