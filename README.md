@@ -245,6 +245,50 @@ Inside ComfyUI:
 3. Select your UNet, CLIP, and VAE.
 4. Set your prompt, resolution, and steps, then click **Queue Prompt**.
 
+## Images: the canvas or a reference
+
+The sampler takes images in two different roles. They are not the same thing,
+and the difference shows in the result.
+
+| input | what the engine does | what you get |
+|---|---|---|
+| `input_image` | img2img: the image is VAE-encoded and the denoise starts from its noised latent | the **composition stays** — same framing, pose and background, re-textured by the prompt |
+| `reference_image_1` … `reference_image_5` | the image is encoded by the vision tower and conditions the generation | a **new image** — the prompt decides the scene, the reference steers style, colours and subject |
+
+`strength` belongs to the img2img path: 1.0 ignores the input image and
+generates from noise, 0.5 keeps half of it.
+
+Measured with an apple as the input image and the prompt "a blue ceramic
+teapot on a plain white background":
+
+- `input_image` at strength 0.5 → a blue ceramic **jar** in the apple's scene:
+  the layout is the input's, the look is the prompt's.
+- `reference_image_1` → a clean **teapot on white**: the prompt won, the
+  reference only steered it.
+
+Every reference socket takes a batch, so one socket can carry several
+references; the numbered sockets exist so references of different sizes can go
+side by side.
+
+Reference images need the **Qwen3-VL vision tower**
+(`mmproj-Qwen3VL-8B-Instruct-F16.gguf`): connect it to the **Vision Encoder**
+input. Without it the engine stops with "Qwen Image 2.1 editing requires
+Qwen3-VL vision weights". A text encoder that already carries the vision
+tower (the combined Qwen3-VL GGUF) does the job on its own.
+
+## Tests
+
+```sh
+./venv/bin/python custom_nodes/ComfyUI-SDCPP/tests/test_node_schema.py
+```
+
+The test pins the input names of every node and the order of the widget
+values. ComfyUI hands the inputs to a node by name and saves the widget
+values positionally, so a renamed input or a moved widget breaks the saved
+workflows silently — the node loads and then renders something else. The test
+also fails when a node's schema and its function disagree, which is a runtime
+error on the first call.
+
 ## LoRA
 
 stable-diffusion.cpp supports LoRAs the A1111 way: the weights live in

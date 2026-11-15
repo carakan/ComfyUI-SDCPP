@@ -691,6 +691,17 @@ def model_context_args(diffusion_model, vae, tokenizer, encoders, vision_encoder
     return args
 
 
+def save_image_tensors(tensors, workdir, prefix):
+    """Write image tensors as PNG files and return their paths."""
+    paths = []
+    for index, tensor in enumerate(tensors):
+        array = (tensor.cpu().numpy() * 255.0).round().astype("uint8")
+        path = os.path.join(workdir, f"{prefix}_{index}.png")
+        Image.fromarray(array).save(path)
+        paths.append(path)
+    return paths
+
+
 def server_request(prompt, negative_prompt, width, height, steps, cfg_scale, seed,
                    sampling_method, scheduler, flow_shift, sigmas, strength,
                    vae_tiling, lora, prompt_loras, workdir, input_image, reference_images):
@@ -729,18 +740,9 @@ def server_request(prompt, negative_prompt, width, height, steps, cfg_scale, see
     if vae_tiling:
         body["vae_tiling_params"] = {"enabled": True}
     if input_image is not None:
-        array = (input_image[0].cpu().numpy() * 255.0).round().astype("uint8")
-        path = os.path.join(workdir, "input.png")
-        Image.fromarray(array).save(path)
-        body["init_image"] = path
+        body["init_image"] = save_image_tensors([input_image[0]], workdir, "input")[0]
     if reference_images:
-        paths = []
-        for index, tensor in enumerate(reference_images):
-            array = (tensor.cpu().numpy() * 255.0).round().astype("uint8")
-            path = os.path.join(workdir, f"ref_{index}.png")
-            Image.fromarray(array).save(path)
-            paths.append(path)
-        body["ref_images"] = paths
+        body["ref_images"] = save_image_tensors(reference_images, workdir, "ref")
     return body
 
 
@@ -1043,12 +1045,17 @@ class SDCPPSampler:
                 "vision_encoder": ("SDCPP_MODEL",),
                 "lora": ("SDCPP_LORA",),
                 "reference_image_1": ("IMAGE", {"tooltip": "First reference image. "
+                                                            "The vision tower encodes it and it steers the "
+                                                            "result; the prompt still decides the scene. "
                                                             "sd.cpp takes one --ref-image per image, in order."}),
                 "reference_image_2": ("IMAGE", {"tooltip": "Second reference image."}),
                 "reference_image_3": ("IMAGE", {"tooltip": "Third reference image."}),
-                "input_image": ("IMAGE", {"tooltip": "Denoise starting from this image instead of "
-                                                     "noise (img2img); strength below 1 keeps more of it."}),
-                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "input_image": ("IMAGE", {"tooltip": "img2img: this image is the canvas. The prompt "
+                                                     "re-textures it and the composition stays. Use a "
+                                                     "reference image to steer instead of to paint over."}),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                                       "tooltip": "How much of the input image survives: 1.0 ignores it "
+                                                  "and generates from noise, 0.5 keeps half of it."}),
                 "flash_attention": ("BOOLEAN", {"default": False,
                                                 "tooltip": "sd.cpp's flash attention: smaller activations "
                                                            "and faster sampling on Metal."}),
@@ -1074,6 +1081,8 @@ class SDCPPSampler:
                                                             "VRAM, leaving more of the card to the "
                                                             "diffusion model and LoRAs. Slower prompt "
                                                             "encoding."}),
+                "reference_image_4": ("IMAGE", {"tooltip": "Fourth reference image."}),
+                "reference_image_5": ("IMAGE", {"tooltip": "Fifth reference image."}),
             },
         }
 
@@ -1096,8 +1105,7 @@ class SDCPPSampler:
 
     def _render_with_server(self, context_args, prompt, negative_prompt, width, height,
                             steps, cfg_scale, seed, sampling_method, scheduler, flow_shift,
-                            sigmas, strength, vae_tiling, lora, input_image,
-                            reference_image_1, reference_image_2, reference_image_3):
+                            sigmas, strength, vae_tiling, lora, input_image, references):
         """Render through the resident sd-server process.
 
         The server keeps the model loaded, so the second render of a workflow
@@ -1105,10 +1113,6 @@ class SDCPPSampler:
         """
         server = get_server()
         clean_prompt, prompt_loras = split_lora_tags(prompt)
-        references = []
-        for group in (reference_image_1, reference_image_2, reference_image_3):
-            if group is not None:
-                references.extend(group)
 
         with _sdcli_lock:
             comfy.model_management.throw_exception_if_processing_interrupted()
@@ -1128,7 +1132,14 @@ class SDCPPSampler:
                  offload_to_cpu=False, text_encoder_2=None, tokenizer=None, vision_encoder=None, lora=None,
                  input_image=None, strength=1.0, flash_attention=False, text_encoder_cpu=True,
                  reference_image_1=None, reference_image_2=None, reference_image_3=None,
+                 reference_image_4=None, reference_image_5=None,
                  sigmas="", model_args="", randomize_prompt=True):
+        # The reference slots are batches: every image in them is one reference.
+        references = []
+        for group in (reference_image_1, reference_image_2, reference_image_3,
+                      reference_image_4, reference_image_5):
+            if group is not None:
+                references.extend(group)
         if randomize_prompt:
             # A fixed seed keeps the choice reproducible, seed -1 (sd-cli picks
             # the noise seed itself) gets a new one on every run.
@@ -1171,8 +1182,7 @@ class SDCPPSampler:
                                                 width, height, steps, cfg_scale, seed,
                                                 sampling_method, scheduler, flow_shift,
                                                 sigmas, strength, vae_tiling, lora,
-                                                input_image, reference_image_1,
-                                                reference_image_2, reference_image_3)
+                                                input_image, references)
             except Exception as error:
                 # The server is an optimisation, never a dependency: any
                 # failure goes back to the spawn path.
@@ -1216,26 +1226,15 @@ class SDCPPSampler:
                 # more of the card to the diffusion model and LoRAs.
                 cmd += ["--params-backend", "te=cpu"]
             if input_image is not None:
-                array = (input_image[0].cpu().numpy() * 255.0).round().astype("uint8")
-                input_path = os.path.join(workdir, "input.png")
-                Image.fromarray(array).save(input_path)
+                input_path = save_image_tensors([input_image[0]], workdir, "input")[0]
                 cmd += ["-i", input_path, "--strength", str(strength)]
-            if any(image is not None for image in
-                   (reference_image_1, reference_image_2, reference_image_3)):
+            if references:
                 # Separate tensors, so the numbered references do not have to
                 # share their dimensions - a portrait and a landscape reference
                 # can go in side by side. sd.cpp still wants each of them to be
                 # a multiple of 32 in both directions.
-                groups = [image for image in (reference_image_1, reference_image_2, reference_image_3)
-                          if image is not None]
-                index = 0
-                for group in groups:
-                    for tensor in group:
-                        array = (tensor.cpu().numpy() * 255.0).round().astype("uint8")
-                        path = os.path.join(workdir, f"ref_{index}.png")
-                        Image.fromarray(array).save(path)
-                        cmd += ["--ref-image", path]
-                        index += 1
+                for path in save_image_tensors(references, workdir, "ref"):
+                    cmd += ["--ref-image", path]
 
             progress = comfy.utils.ProgressBar(steps)
             lines = []
