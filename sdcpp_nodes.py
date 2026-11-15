@@ -1050,12 +1050,9 @@ class SDCPPSampler:
                                                             "sd.cpp takes one --ref-image per image, in order."}),
                 "reference_image_2": ("IMAGE", {"tooltip": "Second reference image."}),
                 "reference_image_3": ("IMAGE", {"tooltip": "Third reference image."}),
-                "input_image": ("IMAGE", {"tooltip": "img2img: this image is the canvas. The prompt "
-                                                     "re-textures it and the composition stays. Use a "
-                                                     "reference image to steer instead of to paint over."}),
-                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                                       "tooltip": "How much of the input image survives: 1.0 ignores it "
-                                                  "and generates from noise, 0.5 keeps half of it."}),
+                "input_image": ("IMAGE", {"tooltip": "Denoise starting from this image instead of "
+                                                     "noise (img2img); strength below 1 keeps more of it."}),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "flash_attention": ("BOOLEAN", {"default": False,
                                                 "tooltip": "sd.cpp's flash attention: smaller activations "
                                                            "and faster sampling on Metal."}),
@@ -1081,8 +1078,6 @@ class SDCPPSampler:
                                                             "VRAM, leaving more of the card to the "
                                                             "diffusion model and LoRAs. Slower prompt "
                                                             "encoding."}),
-                "reference_image_4": ("IMAGE", {"tooltip": "Fourth reference image."}),
-                "reference_image_5": ("IMAGE", {"tooltip": "Fifth reference image."}),
             },
         }
 
@@ -1132,12 +1127,10 @@ class SDCPPSampler:
                  offload_to_cpu=False, text_encoder_2=None, tokenizer=None, vision_encoder=None, lora=None,
                  input_image=None, strength=1.0, flash_attention=False, text_encoder_cpu=True,
                  reference_image_1=None, reference_image_2=None, reference_image_3=None,
-                 reference_image_4=None, reference_image_5=None,
                  sigmas="", model_args="", randomize_prompt=True):
         # The reference slots are batches: every image in them is one reference.
         references = []
-        for group in (reference_image_1, reference_image_2, reference_image_3,
-                      reference_image_4, reference_image_5):
+        for group in (reference_image_1, reference_image_2, reference_image_3):
             if group is not None:
                 references.extend(group)
         if randomize_prompt:

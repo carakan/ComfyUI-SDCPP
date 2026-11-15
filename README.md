@@ -253,7 +253,7 @@ and the difference shows in the result.
 | input | what the engine does | what you get |
 |---|---|---|
 | `input_image` | img2img: the image is VAE-encoded and the denoise starts from its noised latent | the **composition stays** — same framing, pose and background, re-textured by the prompt |
-| `reference_image_1` … `reference_image_5` | the image is encoded by the vision tower and conditions the generation | a **new image** — the prompt decides the scene, the reference steers style, colours and subject |
+| `reference_image_1` … `reference_image_3` | the image is encoded by the vision tower and conditions the generation | a **new image** — the prompt decides the scene, the reference steers style, colours and subject |
 
 `strength` belongs to the img2img path: 1.0 ignores the input image and
 generates from noise, 0.5 keeps half of it.
@@ -268,7 +268,9 @@ teapot on a plain white background":
 
 Every reference socket takes a batch, so one socket can carry several
 references; the numbered sockets exist so references of different sizes can go
-side by side.
+side by side. There were three numbered sockets since November 2026; a single
+batch socket named `reference_images` existed before that and was removed,
+because the numbered sockets cover it.
 
 Reference images need the **Qwen3-VL vision tower**
 (`mmproj-Qwen3VL-8B-Instruct-F16.gguf`): connect it to the **Vision Encoder**

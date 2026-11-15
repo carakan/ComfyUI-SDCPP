@@ -47,8 +47,7 @@ SAMPLER_OPTIONAL = [
     "vae", "text_encoder", "text_encoder_2", "tokenizer", "vision_encoder",
     "lora", "reference_image_1", "reference_image_2", "reference_image_3",
     "input_image", "strength", "flash_attention", "sigmas", "model_args",
-    "randomize_prompt", "text_encoder_cpu", "reference_image_4",
-    "reference_image_5",
+    "randomize_prompt", "text_encoder_cpu",
 ]
 # The widget values of a saved workflow are positional, so this order matters.
 # diffusion_model is a socket (SDCPP_MODEL), not a widget: the loader node
@@ -65,8 +64,6 @@ IMAGE_INPUTS = {
     "reference_image_1": "reference: the vision tower steers the result",
     "reference_image_2": "reference: the vision tower steers the result",
     "reference_image_3": "reference: the vision tower steers the result",
-    "reference_image_4": "reference: the vision tower steers the result",
-    "reference_image_5": "reference: the vision tower steers the result",
 }
 
 failures = []
