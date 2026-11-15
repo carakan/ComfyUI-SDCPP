@@ -709,12 +709,6 @@ class SDCPPSampler:
                                                             "VRAM, leaving more of the card to the "
                                                             "diffusion model and LoRAs. Slower prompt "
                                                             "encoding."}),
-                "backend": ("STRING", {"default": "",
-                                       "tooltip": "sd.cpp --backend assignment, e.g. cpu, te=cpu, "
-                                                  "diffusion=cpu. Empty leaves every module where the "
-                                                  "engine puts it. Use cpu for models the Metal "
-                                                  "backend cannot run (MiniMax-H3-Image segfaults in "
-                                                  "ggml_metal_encoder_set_pipeline on the AMD card)."}),
             },
         }
 
@@ -741,7 +735,7 @@ class SDCPPSampler:
                  offload_to_cpu=False, text_encoder_2=None, tokenizer=None, vision_encoder=None, lora=None,
                  input_image=None, strength=1.0, flash_attention=False, text_encoder_cpu=True,
                  reference_image_1=None, reference_image_2=None, reference_image_3=None,
-                 sigmas="", model_args="", randomize_prompt=True, backend=""):
+                 sigmas="", model_args="", randomize_prompt=True):
         if randomize_prompt:
             # A fixed seed keeps the choice reproducible, seed -1 (sd-cli picks
             # the noise seed itself) gets a new one on every run.
@@ -821,10 +815,6 @@ class SDCPPSampler:
                 # Encode on the CPU: the encoder never sits in VRAM, leaving
                 # more of the card to the diffusion model and LoRAs.
                 cmd += ["--params-backend", "te=cpu"]
-            if backend.strip():
-                # Runtime backend assignment, e.g. cpu or te=cpu. Models the
-                # Metal backend cannot run need it.
-                cmd += ["--backend", backend.strip()]
             if input_image is not None:
                 array = (input_image[0].cpu().numpy() * 255.0).round().astype("uint8")
                 input_path = os.path.join(workdir, "input.png")
