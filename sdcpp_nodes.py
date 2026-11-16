@@ -345,6 +345,25 @@ SAMPLING_METHODS = [
     "dpm++2m_sde", "dpm++2m_sde_bt", "lms",
 ]
 
+# The output size the sampler generates at. A preset sets the width and the
+# height; "custom" leaves the two widgets alone. Nothing is resized: the
+# image is rendered at the size that is asked for.
+RESOLUTIONS = {
+    "custom (width/height)": None,
+    "896x1152 (portrait 7:9)": (896, 1152),
+    "864x1152 (portrait 3:4)": (864, 1152),
+    "896x1120 (portrait 4:5)": (896, 1120),
+    "792x1000 (portrait)": (792, 1000),
+    "765x945 (portrait)": (765, 945),
+    "512x768 (portrait 2:3)": (512, 768),
+    "1024x1536 (portrait 2:3)": (1024, 1536),
+    "1152x896 (landscape 9:7)": (1152, 896),
+    "1152x864 (landscape 4:3)": (1152, 864),
+    "1536x1024 (landscape 3:2)": (1536, 1024),
+    "768x512 (landscape 3:2)": (768, 512),
+    "1024x1024 (square)": (1024, 1024),
+}
+
 SCHEDULERS = [
     "discrete", "karras", "exponential", "ays", "gits", "sgm_uniform", "simple",
     "smoothstep", "kl_optimal", "lcm", "bong_tangent", "ltx2", "logit_normal",
@@ -1081,6 +1100,11 @@ class SDCPPSampler:
                                                             "VRAM, leaving more of the card to the "
                                                             "diffusion model and LoRAs. Slower prompt "
                                                             "encoding."}),
+                "resolution": (list(RESOLUTIONS.keys()),
+                               {"default": "custom (width/height)",
+                                "tooltip": "The size of the generated image. A preset sets the "
+                                           "width and the height above; the image is rendered "
+                                           "at that size, nothing is resized."}),
             },
         }
 
@@ -1131,7 +1155,12 @@ class SDCPPSampler:
                  reference_image_4=None, input_image=None, strength=1.0,
                  flash_attention=False, text_encoder_cpu=True,
                  reference_image_1=None, reference_image_2=None, reference_image_3=None,
-                 sigmas="", model_args="", randomize_prompt=True):
+                 sigmas="", model_args="", randomize_prompt=True,
+                 resolution="custom (width/height)"):
+        size = RESOLUTIONS.get(resolution)
+        if size is not None:
+            width, height = size
+
         # The reference slots are batches: every image in them is one reference.
         references = []
         for group in (reference_image_1, reference_image_2, reference_image_3, input_image):

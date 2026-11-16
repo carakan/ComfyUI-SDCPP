@@ -47,7 +47,7 @@ SAMPLER_OPTIONAL = [
     "vae", "text_encoder", "text_encoder_2", "tokenizer", "vision_encoder",
     "lora", "reference_image_1", "reference_image_2", "reference_image_3",
     "reference_image_4", "input_image", "strength", "flash_attention", "sigmas", "model_args",
-    "randomize_prompt", "text_encoder_cpu",
+    "randomize_prompt", "text_encoder_cpu", "resolution",
 ]
 # The widget values of a saved workflow are positional, so this order matters.
 # diffusion_model is a socket (SDCPP_MODEL), not a widget: the loader node
@@ -56,7 +56,7 @@ SAMPLER_WIDGETS = [
     "prompt", "negative_prompt", "width", "height", "steps",
     "cfg_scale", "seed", "sampling_method", "scheduler", "flow_shift",
     "vae_tiling", "max_vram", "offload_to_cpu", "strength", "flash_attention",
-    "sigmas", "model_args", "randomize_prompt", "text_encoder_cpu",
+    "sigmas", "model_args", "randomize_prompt", "text_encoder_cpu", "resolution",
 ]
 # The image inputs and what they do.
 IMAGE_INPUTS = {
@@ -147,6 +147,19 @@ def main():
 
     check("strength" in schema.get("optional", {}),
           "SDCPPSampler lost the strength input of the img2img path")
+
+    # The resolution menu and the sizes it stands for.
+    resolutions = sdcpp_nodes.RESOLUTIONS
+    spec = schema.get("optional", {}).get("resolution")
+    check(spec is not None and list(spec[0]) == list(resolutions),
+          "the resolution choices do not match RESOLUTIONS")
+    for label, size in resolutions.items():
+        if size is None:
+            continue
+        check(label.startswith(f"{size[0]}x{size[1]} ("),
+              f"the resolution label {label!r} does not name its size {size}")
+        check(size[0] >= 64 and size[1] >= 64,
+              f"the resolution {label!r} is smaller than the node allows")
 
     if failures:
         print("FAILED")
