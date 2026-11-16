@@ -46,7 +46,7 @@ SAMPLER_REQUIRED = [
 SAMPLER_OPTIONAL = [
     "vae", "text_encoder", "text_encoder_2", "tokenizer", "vision_encoder",
     "lora", "reference_image_1", "reference_image_2", "reference_image_3",
-    "input_image", "strength", "flash_attention", "sigmas", "model_args",
+    "reference_image_4", "input_image", "strength", "flash_attention", "sigmas", "model_args",
     "randomize_prompt", "text_encoder_cpu",
 ]
 # The widget values of a saved workflow are positional, so this order matters.
@@ -60,7 +60,8 @@ SAMPLER_WIDGETS = [
 ]
 # The image inputs and what they do.
 IMAGE_INPUTS = {
-    "input_image": "img2img: the image is the canvas, the prompt re-textures it",
+    "reference_image_4": "img2img: the image is the canvas, the prompt re-textures it",
+    "input_image": "reference images as a batch",
     "reference_image_1": "reference: the vision tower steers the result",
     "reference_image_2": "reference: the vision tower steers the result",
     "reference_image_3": "reference: the vision tower steers the result",

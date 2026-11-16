@@ -704,7 +704,7 @@ def save_image_tensors(tensors, workdir, prefix):
 
 def server_request(prompt, negative_prompt, width, height, steps, cfg_scale, seed,
                    sampling_method, scheduler, flow_shift, sigmas, strength,
-                   vae_tiling, lora, prompt_loras, workdir, input_image, reference_images):
+                   vae_tiling, lora, prompt_loras, workdir, reference_image_4, reference_images):
     """The native img_gen body for one render."""
     body = {
         "prompt": prompt,
@@ -739,8 +739,8 @@ def server_request(prompt, negative_prompt, width, height, steps, cfg_scale, see
         body["lora"] = entries
     if vae_tiling:
         body["vae_tiling_params"] = {"enabled": True}
-    if input_image is not None:
-        body["init_image"] = save_image_tensors([input_image[0]], workdir, "input")[0]
+    if reference_image_4 is not None:
+        body["init_image"] = save_image_tensors([reference_image_4[0]], workdir, "input")[0]
     if reference_images:
         body["ref_images"] = save_image_tensors(reference_images, workdir, "ref")
     return body
@@ -1050,8 +1050,11 @@ class SDCPPSampler:
                                                             "sd.cpp takes one --ref-image per image, in order."}),
                 "reference_image_2": ("IMAGE", {"tooltip": "Second reference image."}),
                 "reference_image_3": ("IMAGE", {"tooltip": "Third reference image."}),
-                "input_image": ("IMAGE", {"tooltip": "Denoise starting from this image instead of "
-                                                     "noise (img2img); strength below 1 keeps more of it."}),
+                "reference_image_4": ("IMAGE", {"tooltip": "Fourth reference image. "
+                                                            "Denoise starting from this image instead of "
+                                                            "noise (img2img); strength below 1 keeps more of it."}),
+                "input_image": ("IMAGE", {"tooltip": "Reference images as a batch: every image in it is "
+                                                     "one reference, like the numbered sockets above."}),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "flash_attention": ("BOOLEAN", {"default": False,
                                                 "tooltip": "sd.cpp's flash attention: smaller activations "
@@ -1100,7 +1103,7 @@ class SDCPPSampler:
 
     def _render_with_server(self, context_args, prompt, negative_prompt, width, height,
                             steps, cfg_scale, seed, sampling_method, scheduler, flow_shift,
-                            sigmas, strength, vae_tiling, lora, input_image, references):
+                            sigmas, strength, vae_tiling, lora, reference_image_4, references):
         """Render through the resident sd-server process.
 
         The server keeps the model loaded, so the second render of a workflow
@@ -1116,7 +1119,7 @@ class SDCPPSampler:
                 body = server_request(clean_prompt, negative_prompt, width, height, steps,
                                       cfg_scale, seed, sampling_method, scheduler, flow_shift,
                                       sigmas, strength, vae_tiling, lora, prompt_loras,
-                                      workdir, input_image, references)
+                                      workdir, reference_image_4, references)
                 images = server.render(body, steps)
             array = np.asarray(images[0].convert("RGB")).astype(np.float32) / 255.0
             return (torch.from_numpy(array)[None],)
@@ -1125,12 +1128,13 @@ class SDCPPSampler:
                  width, height, steps, cfg_scale, seed, sampling_method, scheduler,
                  flow_shift, vae_tiling, vae=None, text_encoder=None, max_vram=0.0,
                  offload_to_cpu=False, text_encoder_2=None, tokenizer=None, vision_encoder=None, lora=None,
-                 input_image=None, strength=1.0, flash_attention=False, text_encoder_cpu=True,
+                 reference_image_4=None, input_image=None, strength=1.0,
+                 flash_attention=False, text_encoder_cpu=True,
                  reference_image_1=None, reference_image_2=None, reference_image_3=None,
                  sigmas="", model_args="", randomize_prompt=True):
         # The reference slots are batches: every image in them is one reference.
         references = []
-        for group in (reference_image_1, reference_image_2, reference_image_3):
+        for group in (reference_image_1, reference_image_2, reference_image_3, input_image):
             if group is not None:
                 references.extend(group)
         if randomize_prompt:
@@ -1175,7 +1179,7 @@ class SDCPPSampler:
                                                 width, height, steps, cfg_scale, seed,
                                                 sampling_method, scheduler, flow_shift,
                                                 sigmas, strength, vae_tiling, lora,
-                                                input_image, references)
+                                                reference_image_4, references)
             except Exception as error:
                 # The server is an optimisation, never a dependency: any
                 # failure goes back to the spawn path.
@@ -1218,8 +1222,8 @@ class SDCPPSampler:
                 # Encode on the CPU: the encoder never sits in VRAM, leaving
                 # more of the card to the diffusion model and LoRAs.
                 cmd += ["--params-backend", "te=cpu"]
-            if input_image is not None:
-                input_path = save_image_tensors([input_image[0]], workdir, "input")[0]
+            if reference_image_4 is not None:
+                input_path = save_image_tensors([reference_image_4[0]], workdir, "input")[0]
                 cmd += ["-i", input_path, "--strength", str(strength)]
             if references:
                 # Separate tensors, so the numbered references do not have to

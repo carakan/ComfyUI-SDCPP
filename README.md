@@ -127,7 +127,7 @@ Optional sampler inputs:
 | `text_encoder_2` | second encoder for models that need two (Qwen-Image 1.x style: T5 **and** CLIP-L) |
 | `vision_encoder` | the Qwen3-VL vision tower (`mmproj`), needed for reference-image (edit) workflows |
 | `lora` | a LoRA from **`SD.cpp LoRA (sd-cli)`** — see the LoRA section below |
-| `reference_image_1` / `reference_image_2` / `reference_image_3` | one `IMAGE` each, passed as `--ref-image` in that order. Separate sockets, so the references do not have to share one size. sd.cpp still wants each reference to be a multiple of 32 in both directions |
+| `reference_image_1` / `reference_image_2` / `reference_image_3` / `reference_image_4` | one `IMAGE` each, passed as `--ref-image` in that order. `reference_image_4` is the img2img one (see below). Separate sockets, so the references do not have to share one size. sd.cpp still wants each reference to be a multiple of 32 in both directions |
 | `max_vram` | GPU budget in GiB for the model weights. `0` = use all free VRAM. Lower it (e.g. `8`) when the big models do not fit |
 | `flash_attention` | sd.cpp flash attention on the diffusion pass (`--flash-attn off,diffusion=on`) |
 | `text_encoder_cpu` | run the text encoder on the CPU (`--params-backend te=cpu`, default on): it never sits in VRAM, leaving more of the card to the diffusion model and LoRAs, at the cost of slower prompt encoding |
@@ -252,8 +252,9 @@ and the difference shows in the result.
 
 | input | what the engine does | what you get |
 |---|---|---|
-| `input_image` | img2img: the image is VAE-encoded and the denoise starts from its noised latent | the **composition stays** — same framing, pose and background, re-textured by the prompt |
+| `reference_image_4` | img2img: the image is VAE-encoded and the denoise starts from its noised latent | the **composition stays** — same framing, pose and background, re-textured by the prompt |
 | `reference_image_1` … `reference_image_3` | the image is encoded by the vision tower and conditions the generation | a **new image** — the prompt decides the scene, the reference steers style, colours and subject |
+| `input_image` | a batch of references: every image in it is one reference, like the numbered sockets | the same, in one socket |
 
 `strength` belongs to the img2img path: 1.0 ignores the input image and
 generates from noise, 0.5 keeps half of it.
@@ -261,16 +262,15 @@ generates from noise, 0.5 keeps half of it.
 Measured with an apple as the input image and the prompt "a blue ceramic
 teapot on a plain white background":
 
-- `input_image` at strength 0.5 → a blue ceramic **jar** in the apple's scene:
+- `reference_image_4` at strength 0.5 → a blue ceramic **jar** in the apple's scene:
   the layout is the input's, the look is the prompt's.
 - `reference_image_1` → a clean **teapot on white**: the prompt won, the
   reference only steered it.
 
 Every reference socket takes a batch, so one socket can carry several
 references; the numbered sockets exist so references of different sizes can go
-side by side. There were three numbered sockets since November 2026; a single
-batch socket named `reference_images` existed before that and was removed,
-because the numbered sockets cover it.
+side by side. `input_image` is the batch socket: every image in it is one
+reference.
 
 Reference images need the **Qwen3-VL vision tower**
 (`mmproj-Qwen3VL-8B-Instruct-F16.gguf`): connect it to the **Vision Encoder**
