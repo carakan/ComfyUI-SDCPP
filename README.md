@@ -132,7 +132,6 @@ Optional sampler inputs:
 | `flash_attention` | sd.cpp flash attention on the diffusion pass (`--flash-attn off,diffusion=on`) |
 | `text_encoder_cpu` | run the text encoder on the CPU (`--params-backend te=cpu`, default on): it never sits in VRAM, leaving more of the card to the diffusion model and LoRAs, at the cost of slower prompt encoding |
 | `randomize_prompt` | keep one option of every `{a\|b\|c}` group in the positive prompt, picked at random — on by default, see below |
-| `resolution` | the size the image is generated at. A preset sets the width and the height; `custom (width/height)` keeps the two widgets. Nothing is resized — the image is rendered at the size that is asked for |
 
 ### Server mode (one resident engine instead of a process per render)
 
