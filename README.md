@@ -162,14 +162,15 @@ What the node does in server mode:
 1. starts `sd-server` with the workflow's model context (the same
    `--diffusion-model`, `--vae`, `--llm`, `--lora-model-dir` flags the spawn
    path would use) and waits until it reports `state: ready`;
-2. posts the render to `/sdcpp/v1/img_gen` and polls `/sdcpp/v1/jobs/{id}`;
+2. posts the render to `/sdcpp/v1/img_gen` and polls `/sdcpp/v1/jobs/{id}` — a stop (user cancel or timeout) cancels the job, never the process;
 3. decodes the returned image and hands it to ComfyUI.
 
 Differences worth knowing:
 
 - **LoRA travels as data, not as a tag.** The server does not read
   `<lora:file:strength>` inside the prompt, so the node strips those tags and
-  sends them as the structured `lora` field instead.
+  sends them as the structured `lora` field instead; repeated tags for the
+  same file sum their strengths.
 - **Sigma presets do not exist on the server.** The schedule has to be a list
   of numbers. A preset name (`minimax-h3-image`) sends that workflow back to
   the spawn path.

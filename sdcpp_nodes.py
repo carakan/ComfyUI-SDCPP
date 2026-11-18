@@ -360,8 +360,8 @@ def sdcli_path():
         return SDCLI_FALLBACK
     return "sd-cli"
 
-def sdcli_env():
-    """Env for the sd-cli subprocess.
+def sdcli_env(binary=None):
+    """Env for the sd-cli / sd-server subprocess.
 
     The ToshLLM engine build on macOS Intel (AMD over Metal):
     - TOSH_FA_AMD=1 routes flash attention to the _amd kernels - essential
@@ -370,10 +370,14 @@ def sdcli_env():
       and costs on diffusion.
     - GGML_METAL_NCB=3 splits Metal command buffers so big canvases stay
       under the GPU watchdog.
+
+    The knobs apply to the ToshLLM build of *either* binary. Callers pass the
+    binary that is being launched, otherwise the check keys off the CLI path.
     """
     env = dict(os.environ)
+    binary = binary or sdcli_path()
     if (sys.platform == "darwin" and platform.machine() == "x86_64"
-            and "toshllm" in sdcli_path().lower()):
+            and "toshllm" in binary.lower()):
         env["TOSH_FA_AMD"] = "1"
         env["TOSH_MM_WIDE_DISABLE"] = "1"
         env["GGML_METAL_NCB"] = "3"
@@ -447,17 +451,54 @@ def server_idle_minutes():
         return 10.0
 
 
+def _b64_png(tensor):
+    """One ComfyUI image tensor ([H, W, C] float 0..1) as a base64 PNG string.
+
+    Server APIs accept images as base64 (or a data URL); they do not read
+    file paths. The old request builder saved PNGs to a tempdir and sent the
+    path, which sd-server always rejected.
+    """
+    array = (tensor.detach().cpu().numpy() * 255.0).round().astype("uint8")
+    buf = io.BytesIO()
+    Image.fromarray(array).save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def b64_images(tensors):
+    return [_b64_png(t) for t in tensors]
+
+
+class _Interruption(Exception):
+    pass
+
+
 class SDServer:
-    """One sd-server process, driven through its native async API."""
+    """One sd-server process, driven through its native async API.
+
+    Lifecycle
+    ---------
+    - `ensure` reuses the running server only when both the process is alive
+      AND the currently loaded model matches the requested context. The idler
+      unloads (but never kills) the model, so the context key must include
+      "currently loaded" rather than "started with".
+    - Idle watch unloads the model via the API after N minutes with no active
+      render; the process stays up, keeping the cheaper warm-resident startup.
+    """
 
     def __init__(self):
         self.process = None
-        self.context_key = None
-        self.last_used = 0.0
-        self.lock = threading.RLock()
+        self.context_args = []
         self.idle_thread = None
         self.log_handle = None
         self.log_path = None
+        self.last_used = 0.0
+        # A single process-wide lock is still needed to avoid spawning two
+        # sd-servers racing on the same GPU, but it should only be held
+        # during launch/teardown, not across a whole generation.
+        self.lock = threading.RLock()
+        self.generation_lock = threading.Lock()
+        self.in_flight = 0
+        self.model_loaded = False
 
     # -- process -----------------------------------------------------------
     def alive(self):
@@ -472,9 +513,22 @@ class SDServer:
         data = json.dumps(body).encode("utf-8") if body is not None else None
         request = urllib.request.Request(url, data=data, method=method,
                                          headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read()
-            return response.status, (json.loads(raw) if raw else {})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read()
+                return response.status, (json.loads(raw) if raw else {})
+        except urllib.error.HTTPError as error:
+            raw = error.read() if error.fp else b""
+            try:
+                payload = json.loads(raw) if raw else {}
+            except Exception:
+                payload = {"error": raw.decode("utf-8", errors="replace")}
+            return error.code, payload
+
+    def _status(self):
+        """Return the /models/status payload, or None when the server is away."""
+        status, payload = self._http("GET", "/sdcpp/v1/models/status", timeout=5)
+        return payload if status == 200 else None
 
     def stop(self):
         with self.lock:
@@ -483,13 +537,35 @@ class SDServer:
             self._log("stopping the server")
             _sdcli_stop(self.process)
             self.process = None
-            self.context_key = None
+            self.model_loaded = False
+            self.context_args = []
             if getattr(self, "log_handle", None) is not None:
                 try:
                     self.log_handle.close()
                 except OSError:
                     pass
                 self.log_handle = None
+
+    def _wait_ready(self, timeout=600):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.process is not None and self.process.poll() is not None:
+                raise RuntimeError(
+                    "sd-server exited while loading the model; see "
+                    + (self.log_path or "the server log file")
+                )
+            status = self._status()
+            if status:
+                if status.get("state") == "ready":
+                    self._log("model loaded")
+                    self.model_loaded = True
+                    self.context_args = list(self._pending_args)
+                    self.last_used = time.time()
+                    return
+                if status.get("state") == "error" or status.get("error"):
+                    raise RuntimeError(f"the server could not load the model: {status.get('error')}")
+            time.sleep(1.0)
+        raise RuntimeError("sd-server did not load the model in time")
 
     def _start(self, context_args, env):
         binary = sdserver_path()
@@ -505,52 +581,40 @@ class SDServer:
             "--log-level", os.environ.get("SDCPP_SERVER_LOG_LEVEL", "warn"),
             "--conditioning-cache-size", os.environ.get("SDCPP_SERVER_CONDITIONING_CACHE", "8"),
         ]
+        # Let sd-server resolve LoRA stems from its own model roots.
+        for path in sorted({p for p in os.environ.get("SDCPP_MODEL_DIRS", os.path.expanduser("~/models/imagen")).split(os.pathsep) if p}):
+            cmd += ["--model-dir", path]
         cmd += context_args
         self._log(f"starting: {' '.join(cmd)}")
-        # The server writes its own progress and timings. A pipe nobody reads
-        # fills up and blocks the server, so the output goes to a file.
         self.log_path = os.path.join(tempfile.gettempdir(), "sdcpp-sd-server.log")
         self.log_handle = open(self.log_path, "w")
         self.process = subprocess.Popen(cmd, stdout=self.log_handle, stderr=subprocess.STDOUT,
                                         text=True, env=env)
-        self._wait_ready()
+        self._pending_args = list(context_args)
         self._start_idle_watch()
-
-    def _wait_ready(self, timeout=600):
-        """Wait until the server has the model loaded and answers."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if self.process is not None and self.process.poll() is not None:
-                raise RuntimeError("sd-server exited while loading the model")
-            try:
-                status, payload = self._http("GET", "/sdcpp/v1/models/status", timeout=10)
-                if status == 200 and payload.get("state") == "ready":
-                    self._log("model loaded")
-                    return
-                if payload.get("error"):
-                    raise RuntimeError(f"the server could not load the model: {payload['error']}")
-            except urllib.error.HTTPError:
-                pass
-            except RuntimeError:
-                raise
-            except Exception:
-                pass
-            time.sleep(1.0)
-        raise RuntimeError("sd-server did not load the model in time")
+        self._wait_ready()
 
     def ensure(self, context_args, env):
-        """Reuse the server when the model context matches, else restart it."""
+        """Reuse the running server only when the loaded model matches."""
         with self.lock:
-            key = " ".join(context_args)
-            if self.alive() and self.context_key == key:
-                self.last_used = time.time()
-                return
-            self.stop()
-            self.context_key = key
+            if self.alive() and self.model_loaded and self.context_args == list(context_args):
+                # Cheap re-confirmation: the idler may have unloaded between renders.
+                status = self._status()
+                if status and status.get("state") in ("ready", "loading"):
+                    if status.get("state") == "ready":
+                        self.last_used = time.time()
+                        return True
+            if self.alive() and self.model_loaded:
+                status = self._status()
+                if status and status.get("state") == "empty":
+                    # Idler already unloaded the old context; nothing to stop.
+                    self.stop()
+                else:
+                    self.stop()
             self._start(context_args, env)
-            self.last_used = time.time()
+            self._start_idle_watch()
+            return True
 
-    # -- idle handling -----------------------------------------------------
     def _start_idle_watch(self):
         if self.idle_thread is not None:
             return
@@ -562,48 +626,72 @@ class SDServer:
                     minutes = server_idle_minutes()
                     if minutes <= 0 or not self.alive():
                         continue
-                    if time.time() - self.last_used < minutes * 60:
-                        continue
-                    self._log("idle: unloading the model to give the VRAM back")
-                    try:
-                        self._http("POST", "/sdcpp/v1/models/unload", {}, timeout=30)
-                    except Exception as error:
-                        self._log(f"idle unload failed: {error}")
-                    self.last_used = time.time()
-                except Exception:
-                    continue
+                    with self.lock:
+                        if self.in_flight > 0:
+                            continue
+                        if time.time() - self.last_used < minutes * 60:
+                            continue
+                        if self._status() and self._status().get("state") == "empty":
+                            continue
+                        self._log("idle: unloading the model to free VRAM")
+                        status, payload = self._http("POST", "/sdcpp/v1/models/unload", {}, timeout=30)
+                        if status == 409 or (status == 503 and payload.get("code") == "model_busy"):
+                            # A job is still pending; try again next tick.
+                            self.last_used = time.time()
+                            continue
+                        if status == 200:
+                            self.model_loaded = False
+                            self._log("idle unload done")
+                except Exception as error:
+                    self._log(f"idle watch error: {error}")
 
         self.idle_thread = threading.Thread(target=watch, daemon=True)
         self.idle_thread.start()
 
     # -- render ------------------------------------------------------------
     def render(self, body, steps, timeout=3600):
-        """Submit a generation, poll it, and return the images as PIL objects."""
-        status, payload = self._http("POST", "/sdcpp/v1/img_gen", body, timeout=120)
+        """Submit a generation and wait for it. Cancellations cancel the job."""
+        status, payload = self._http("POST", "/sdcpp/v1/img_gen", body, timeout=60)
         if status not in (200, 202):
-            raise RuntimeError(f"sd-server refused the request: {status} {payload}")
+            message = payload.get("error", payload) if isinstance(payload, dict) else payload
+            raise RuntimeError(f"sd-server refused the request ({status}): {message}")
         job_id = payload.get("id")
         if not job_id:
             raise RuntimeError(f"sd-server returned no job id: {payload}")
 
         progress = comfy.utils.ProgressBar(steps)
         deadline = time.time() + timeout
-        while time.time() < deadline:
-            comfy.model_management.throw_exception_if_processing_interrupted()
-            status, job = self._http("GET", f"/sdcpp/v1/jobs/{job_id}", timeout=30)
-            state = job.get("status")
-            job_progress = job.get("progress") or {}
-            total = job_progress.get("total")
-            if total:
-                progress.update(int(job_progress.get("completed") or 0))
-            if state == "completed":
-                break
-            if state in ("failed", "cancelled"):
-                error = job.get("error") or {}
-                raise RuntimeError(f"sd-server job {state}: {error.get('message') or error}")
-            time.sleep(0.4)
-        else:
-            raise RuntimeError("sd-server job did not finish in time")
+        self.in_flight += 1
+        self.last_used = time.time()
+        try:
+            while time.time() < deadline:
+                try:
+                    comfy.model_management.throw_exception_if_processing_interrupted()
+                except Exception:
+                    try:
+                        self._http("POST", f"/sdcpp/v1/jobs/{job_id}/cancel", {}, timeout=10)
+                    except Exception:
+                        pass
+                    raise
+
+                status, job = self._http("GET", f"/sdcpp/v1/jobs/{job_id}", timeout=30)
+                state = job.get("status")
+                job_progress = job.get("progress") or {}
+                total = job_progress.get("total")
+                if total:
+                    progress.update(int(job_progress.get("completed") or 0))
+                if state == "completed":
+                    break
+                if state in ("failed", "cancelled"):
+                    error = job.get("error") or {}
+                    raise RuntimeError(f"sd-server job {state}: {error.get('message') or error}")
+                time.sleep(0.4)
+            else:
+                self._http("POST", f"/sdcpp/v1/jobs/{job_id}/cancel", {}, timeout=10)
+                raise RuntimeError("sd-server job did not finish in time")
+        finally:
+            self.in_flight -= 1
+            self.last_used = time.time()
 
         images = (job.get("result") or {}).get("images") or []
         if not images:
@@ -613,7 +701,9 @@ class SDServer:
             encoded = entry.get("b64_json")
             if not encoded:
                 continue
-            out.append(Image.open(io.BytesIO(base64.b64decode(encoded))))
+            raw = Image.open(io.BytesIO(base64.b64decode(encoded)))
+            raw.load()
+            out.append(raw)
         if not out:
             raise RuntimeError("sd-server returned an image without data")
         return out
@@ -667,12 +757,16 @@ def parse_sigma_list(sigmas):
     return values or None
 
 
-def model_context_args(diffusion_model, vae, tokenizer, encoders, vision_encoder, lora):
-    """The model context flags, shared by the spawn path and the server start."""
+def model_context_args(diffusion_model, vae, tokenizer, encoders, vision_encoder, lora,
+                       max_vram=0.0, offload_to_cpu=False, flash_attention=False,
+                       text_encoder_cpu=True, model_args=""):
+    """The model context flags, shared by the spawn path and the server start.
+
+    The server receives the same placement/performance knobs as sd-cli, so the
+    resident engine behaves identically to a one-shot render on this Mac.
+    """
     args = []
     if diffusion_model.full_checkpoint:
-        # The file also holds the text encoders and the VAE, so sd.cpp
-        # loads it whole instead of taking them from separate files.
         args += ["--model", diffusion_model.path]
     else:
         args += ["--diffusion-model", diffusion_model.path]
@@ -688,11 +782,24 @@ def model_context_args(diffusion_model, vae, tokenizer, encoders, vision_encoder
         args += ["--llm_vision", vision_encoder.path]
     if lora is not None:
         args += ["--lora-model-dir", os.path.dirname(lora.path)]
+    if max_vram > 0:
+        args += ["--max-vram", str(max_vram)]
+    if offload_to_cpu:
+        args += ["--offload-to-cpu"]
+    if flash_attention:
+        args += ["--flash-attn", "off,diffusion=on"]
+    if text_encoder_cpu:
+        args += ["--params-backend", "te=cpu"]
+    if model_args.strip():
+        args += ["--model-args", model_args.strip()]
     return args
 
 
 def save_image_tensors(tensors, workdir, prefix):
-    """Write image tensors as PNG files and return their paths."""
+    """Write image tensors as PNG files and return their paths.
+
+    Only the spawn (sd-cli) path uses files; the server path sends base64.
+    """
     paths = []
     for index, tensor in enumerate(tensors):
         array = (tensor.cpu().numpy() * 255.0).round().astype("uint8")
@@ -702,10 +809,33 @@ def save_image_tensors(tensors, workdir, prefix):
     return paths
 
 
+def merge_lora_entries(entries):
+    """Merge (path, multiplier) tuples into one request entry per file.
+
+    stable-diffusion.cpp's JSON parser already sums the multiplier per repeated
+    path (the same map behaviour as the cli merging), but doing it here keeps
+    the request small and makes intent obvious.
+    """
+    merged = {}
+    order = []
+    for name, multiplier in entries:
+        if name not in merged:
+            order.append(name)
+            merged[name] = 0.0
+        merged[name] += multiplier
+    return [{"path": name, "multiplier": merged[name]} for name in order]
+
+
 def server_request(prompt, negative_prompt, width, height, steps, cfg_scale, seed,
                    sampling_method, scheduler, flow_shift, sigmas, strength,
-                   vae_tiling, lora, prompt_loras, workdir, reference_image_4, reference_images):
-    """The native img_gen body for one render."""
+                   vae_tiling, lora, prompt_loras, workdir, reference_image_4, reference_images,
+                   model_args_str="", batch_count=None):
+    """The native img_gen body for one render.
+
+    Images go as base64 PNG strings (the server reads them inline, no paths).
+    LoRAs go as the structured `lora` array `[{path, multiplier}]`. Multiple
+    LoRAs are supported by repeating entries or by summing per file.
+    """
     body = {
         "prompt": prompt,
         "negative_prompt": negative_prompt,
@@ -730,19 +860,20 @@ def server_request(prompt, negative_prompt, width, height, steps, cfg_scale, see
                 f"the server needs the sigma schedule as numbers, not the preset {sigmas.strip()!r}"
             )
         body["sample_params"]["custom_sigmas"] = values
-    entries = []
+    loras = []
     if lora is not None:
-        entries.append({"path": lora.stem, "multiplier": lora.strength})
-    for name, multiplier in prompt_loras:
-        entries.append({"path": name, "multiplier": multiplier})
-    if entries:
-        body["lora"] = entries
+        loras.append((lora.stem, lora.strength))
+    loras.extend(prompt_loras)
+    if loras:
+        body["lora"] = merge_lora_entries(loras)
     if vae_tiling:
         body["vae_tiling_params"] = {"enabled": True}
+    if batch_count is not None:
+        body["batch_count"] = int(batch_count)
     if reference_image_4 is not None:
-        body["init_image"] = save_image_tensors([reference_image_4[0]], workdir, "input")[0]
+        body["init_image"] = _b64_png(reference_image_4[0])
     if reference_images:
-        body["ref_images"] = save_image_tensors(reference_images, workdir, "ref")
+        body["ref_images"] = b64_images(reference_images)
     return body
 
 
@@ -1112,17 +1243,23 @@ class SDCPPSampler:
         server = get_server()
         clean_prompt, prompt_loras = split_lora_tags(prompt)
 
-        with _sdcli_lock:
-            comfy.model_management.throw_exception_if_processing_interrupted()
-            server.ensure(context_args, sdcli_env())
-            with tempfile.TemporaryDirectory() as workdir:
-                body = server_request(clean_prompt, negative_prompt, width, height, steps,
-                                      cfg_scale, seed, sampling_method, scheduler, flow_shift,
-                                      sigmas, strength, vae_tiling, lora, prompt_loras,
-                                      workdir, reference_image_4, references)
-                images = server.render(body, steps)
-            array = np.asarray(images[0].convert("RGB")).astype(np.float32) / 255.0
-            return (torch.from_numpy(array)[None],)
+        comfy.model_management.throw_exception_if_processing_interrupted()
+        # ensure() serialises startup/teardown through its own lock; the GPU
+        # is only contended during the launch window, not for the whole render.
+        server.ensure(context_args, sdcli_env(sdserver_path()))
+
+        body = server_request(clean_prompt, negative_prompt, width, height, steps,
+                              cfg_scale, seed, sampling_method, scheduler, flow_shift,
+                              sigmas, strength, vae_tiling, lora, prompt_loras,
+                              None, reference_image_4, references)
+        images = server.render(body, steps)
+        out = []
+        for raw in images:
+            array = np.asarray(raw.convert("RGB")).astype(np.float32) / 255.0
+            out.append(torch.from_numpy(array))
+        if not out:
+            raise RuntimeError("sd-server returned no image")
+        return (torch.stack(out),)
 
     def generate(self, diffusion_model, prompt, negative_prompt,
                  width, height, steps, cfg_scale, seed, sampling_method, scheduler,
@@ -1155,8 +1292,12 @@ class SDCPPSampler:
 
         # The model context is the same for both paths: the flags that say
         # which model, VAE, encoders and LoRA folder this render uses.
-        context_args = model_context_args(diffusion_model, vae, tokenizer, encoders,
-                                          vision_encoder, lora)
+        context_args = model_context_args(
+            diffusion_model, vae, tokenizer, encoders, vision_encoder, lora,
+            max_vram=max_vram, offload_to_cpu=offload_to_cpu,
+            flash_attention=flash_attention, text_encoder_cpu=text_encoder_cpu,
+            model_args=model_args,
+        )
 
         # sd.cpp takes over the GPU for the whole run. Hand it a clean slate:
         # torch's caching allocator keeps freed blocks reserved, which on this
