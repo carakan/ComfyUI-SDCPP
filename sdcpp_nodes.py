@@ -414,6 +414,9 @@ def sdcli_env(binary=None):
 
 import base64
 import urllib.error
+import atexit
+import signal
+import socket
 import urllib.request
 
 SDSERVER_FALLBACK = "/Applications/ToshLLM.app/Contents/Resources/bin-image/sd-server"
@@ -466,10 +469,6 @@ def _b64_png(tensor):
 
 def b64_images(tensors):
     return [_b64_png(t) for t in tensors]
-
-
-class _Interruption(Exception):
-    pass
 
 
 class SDServer:
@@ -527,7 +526,12 @@ class SDServer:
 
     def _status(self):
         """Return the /models/status payload, or None when the server is away."""
-        status, payload = self._http("GET", "/sdcpp/v1/models/status", timeout=5)
+        try:
+            status, payload = self._http("GET", "/sdcpp/v1/models/status", timeout=5)
+        except Exception:
+            # The socket is not listening yet (or already gone). The caller
+            # decides what to do with a server that is not there.
+            return None
         return payload if status == 200 else None
 
     def stop(self):
@@ -567,6 +571,20 @@ class SDServer:
             time.sleep(1.0)
         raise RuntimeError("sd-server did not load the model in time")
 
+    def _port_is_free(self, host, port):
+        """True when nothing listens on the port, so a new server owns it.
+
+        sd-server shares a port with SO_REUSEPORT: several servers on the same
+        port answer each other's requests with their own model.
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind((host, port))
+            except OSError:
+                return False
+        return True
+
     def _start(self, context_args, env):
         binary = sdserver_path()
         if not os.path.isfile(binary):
@@ -574,6 +592,11 @@ class SDServer:
                 f"sd-server not found at {binary}. Set SDCPP_SERVER_BIN to a stable-diffusion.cpp server build."
             )
         host, port = server_endpoint()
+        if not self._port_is_free(host, port):
+            raise RuntimeError(
+                f"port {port} is taken by another process. A second sd-server on the same "
+                "port answers with the wrong model, so the server path is skipped."
+            )
         cmd = [
             binary,
             "--listen-ip", host,
@@ -675,6 +698,11 @@ class SDServer:
                     raise
 
                 status, job = self._http("GET", f"/sdcpp/v1/jobs/{job_id}", timeout=30)
+                if status != 200:
+                    # The server does not know this job. That happens when a
+                    # second sd-server owns the port and answers with its own
+                    # job list: waiting for the job would never end.
+                    raise RuntimeError(f"sd-server does not know job {job_id} (HTTP {status})")
                 state = job.get("status")
                 job_progress = job.get("progress") or {}
                 total = job_progress.get("total")
@@ -714,6 +742,37 @@ def get_server():
     if _server is None:
         _server = SDServer()
     return _server
+
+
+@atexit.register
+def _stop_server_on_exit():
+    """The server holds the GPU and the port; it must not outlive ComfyUI."""
+    if _server is not None:
+        _server.stop()
+
+
+def _install_term_cleanup():
+    """Stop the server when ComfyUI is terminated.
+
+    ComfyUI handles SIGINT itself (it dumps a traceback on the first Ctrl-C).
+    SIGTERM has no handler, so the interpreter would die without running the
+    atexit hook and the sd-server would keep the GPU and the port.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def handler(signum, frame):
+        _stop_server_on_exit()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    try:
+        signal.signal(signal.SIGTERM, handler)
+    except (ValueError, OSError):
+        pass
+
+
+_install_term_cleanup()
 
 
 LORA_TAG_RE = re.compile(r"<lora:([^:>]+)(?::([^:>]+))?>")

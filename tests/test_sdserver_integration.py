@@ -23,6 +23,8 @@ import base64
 import io
 import json
 import os
+import signal
+import socket
 import sys
 import threading
 import time
@@ -310,6 +312,75 @@ class TestSDServerLifecycle(_FakeBase):
         self.assertTrue(any("/cancel" in c for c in self.server_state.cancel_calls))
         # The server process survives a user cancel; only the job was cancelled.
         self.assertTrue(self.sd.alive())
+
+
+def _free_port():
+    """A port nothing listens on."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+class TestServerGuards(_FakeBase):
+    """The guards that keep a stale or foreign server from hanging a render.
+
+    A second sd-server on the same port answers with its own model and its
+    own job list, so a job submitted to one server and polled on another
+    never finishes. The plugin has to notice that instead of waiting.
+    """
+
+    def test_status_is_none_while_the_server_is_not_listening(self):
+        # A server that is still starting refuses the connection. That has to
+        # look like "the server is not there yet", not like a crash.
+        os.environ["SDCPP_SERVER_PORT"] = str(_free_port())
+        self.assertIsNone(self.sd._status())
+
+    def test_render_fails_when_the_job_is_unknown(self):
+        self._install_running_server(args=("--flag",))
+        # img_gen hands out an id the server does not know: another server
+        # answered the poll. Waiting for that job would never end.
+        self.server_state.hang_job = "ghost"
+        self.server_state.model_state = "ready"
+        body = m.server_request("p", "", 64, 64, 8, 1.0, 1, "euler", "discrete",
+                                -1.0, "", 1.0, True, None, [], None, None, [])
+        with self.assertRaises(RuntimeError) as cm:
+            self.sd.render(body, steps=8, timeout=5)
+        self.assertIn("ghost", str(cm.exception))
+
+    def test_port_is_free_is_false_while_something_listens(self):
+        host, port = m.server_endpoint()
+        self.assertFalse(self.sd._port_is_free(host, port))
+
+    def test_port_is_free_is_true_for_an_unused_port(self):
+        self.assertTrue(self.sd._port_is_free("127.0.0.1", _free_port()))
+
+    def test_start_refuses_to_share_a_taken_port(self):
+        m.SDServer._start = self._old_start  # the real one
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        self.addCleanup(holder.close)
+        os.environ["SDCPP_SERVER_PORT"] = str(holder.getsockname()[1])
+        with self.assertRaises(RuntimeError) as cm:
+            self.sd._start(["--flag"], {})
+        self.assertIn("taken", str(cm.exception))
+        self.assertIsNone(self.sd.process)  # nothing was spawned
+
+    def test_exit_stops_the_server(self):
+        self._install_running_server(args=("--flag",))
+        previous = m._server
+        m._server = self.sd
+        try:
+            m._stop_server_on_exit()
+        finally:
+            m._server = previous
+        self.assertIsNone(self.sd.process)
+        self.assertFalse(self.sd.alive())
+
+    def test_sigterm_handler_is_installed(self):
+        # Without a handler, SIGTERM kills the interpreter without running
+        # the atexit hook and the sd-server keeps the GPU and the port.
+        self.assertNotEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
 
 
 class TestEngineKnobs(unittest.TestCase):
