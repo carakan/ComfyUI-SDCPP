@@ -36,9 +36,9 @@ A custom node for **ComfyUI** that integrates the [stable-diffusion.cpp](https:/
    ```bash
    export SDCPP_BIN=/path/to/sd-cli
    ```
-   Lookup order: `$SDCPP_BIN` →
-   `/Applications/ToshLLM.app/Contents/Resources/bin-image/sd-cli` → `sd-cli`
-   on `$PATH`.
+   Omitting `SDCPP_BIN` uses `sd-cli` on `$PATH`. On Windows, the sibling
+   `sd-server.exe` is found next to `sd-cli.exe`; other platforms use
+   `sd-server`. No ToshLLM installation or OS-specific path is required.
 2. Optionally add model directories (default `~/models/imagen`), separated by
    the platform path separator (`:` on macOS/Linux, `;` on Windows):
    ```bash
@@ -57,35 +57,37 @@ The env vars are read by the server process, so a change needs a ComfyUI
 restart. A wrong `SDCPP_BIN` fails fast with
 `FileNotFoundError: sd-cli not found at ...`.
 
-### macOS on Intel, engine from ToshLLM
+### Stock or patched engines
 
-The machine this plugin was developed on is an Intel Mac with an AMD RX 6800
-XT: ComfyUI runs there on a custom PyTorch MPS build, and the engine is the
-Metal `sd-cli` shipped inside the ToshLLM app build — no Apple Silicon
-anywhere. `ComfyUI/start_comfyui.sh` wires it up:
+The plugin launches only standard sd.cpp arguments and inherits ComfyUI's
+environment unchanged. It does not detect a vendor, GPU, CPU architecture or
+operating system to inject tuning variables. A patched engine can still be
+configured explicitly in the launcher:
 
 ```bash
-export SDCPP_BIN="$HOME/development/toshllm/dist/ToshLLM.app/Contents/Resources/bin-image/sd-cli"
-export SDCPP_MODEL_DIRS="$HOME/models/imagen"
+export SDCPP_BIN=/path/to/your/sd-cli
+export SDCPP_SERVER_BIN=/path/to/your/sd-server  # optional
+# Any additional variables required by that build go here, before ComfyUI starts.
 ```
 
-The launcher only fills a value that is not already set, so exporting these
-before starting it overrides it. Things worth knowing on that setup:
+For the ToshLLM engine, enable its complete performance preset explicitly:
 
-- ComfyUI runs the *dist* build, not the copy installed under
-  `/Applications` — that one is refreshed by hand and drifts behind. Which
-  binary ran is logged as `[sd-cli] cmd:` on every render.
-- On the 16 GiB card, set the sampler's `max_vram` to `8` for the big models
-  (Qwen-Image 2.1) instead of the `0` = use-everything default; a full canvas
-  otherwise fails weight preparation and returns flat noise.
-- On macOS Intel with the ToshLLM binary, the plugin exports the enhanced
-  environment on every `sd-cli` call:
-  ```bash
-  export TOSH_FA_AMD=1          # flash attention routes to the _amd kernels
-  export TOSH_MM_WIDE_DISABLE=1 # wide matmul tile is LLM-tuned; costs on diffusion
-  export GGML_METAL_NCB=3       # Metal command-buffer split under the GPU watchdog
-  ```
-  Nothing to configure; point `SDCPP_BIN` elsewhere and it stays unset.
+```bash
+export SDCPP_TOSHLLM_ENHANCEMENTS=1
+```
+
+This passes `TOSH_FA_AMD=1`, `TOSH_MM_WIDE_DISABLE=1` and
+`GGML_METAL_NCB=3` to **both** `sd-cli` and `sd-server`. It does not alter
+ComfyUI's own environment or depend on macOS, Intel, a GPU model, or a binary
+path. The individual values can still be overridden by exporting them before
+ComfyUI starts. With the option unset or false, no tuning is added.
+
+Which executable ran is logged on every launch. This is useful for checking
+that a workflow uses the intended engine when multiple builds are installed.
+
+Memory is a hardware/model constraint, not an OS one. Start with `max_vram=0`
+(the engine's live free-VRAM default); use an explicit budget such as `8` GiB
+or `offload_to_cpu` if a large model competes with other GPU applications.
 
 ### Python bindings backend
 
@@ -144,7 +146,7 @@ The mode is a process environment switch:
 
 | variable | default | meaning |
 |---|---|---|
-| `SDCPP_MODE` | `server` | `server` keeps one `sd-server` alive, `standalone` spawns `sd-cli` per render |
+| `SDCPP_MODE` | `standalone` | `server` keeps one `sd-server` alive, `standalone` spawns `sd-cli` per render |
 | `SDCPP_SERVER_BIN` | next to `$SDCPP_BIN` | the `sd-server` binary |
 | `SDCPP_SERVER_HOST` | `127.0.0.1` | where the server listens |
 | `SDCPP_SERVER_PORT` | `12727` | the port (upstream's own default, 1234, is left free) |
@@ -153,8 +155,8 @@ The mode is a process environment switch:
 | `SDCPP_SERVER_LOG_LEVEL` | `warn` | the server's own log level |
 
 ```sh
-SDCPP_MODE=server ./start_comfyui.sh      # resident engine (the default now)
-SDCPP_MODE=standalone ./start_comfyui.sh  # one sd-cli per render
+SDCPP_MODE=server ./start_comfyui.sh      # resident engine
+SDCPP_MODE=standalone ./start_comfyui.sh  # one sd-cli per render (the default)
 ```
 
 What the node does in server mode:
@@ -170,7 +172,9 @@ Differences worth knowing:
 - **LoRA travels as data, not as a tag.** The server does not read
   `<lora:file:strength>` inside the prompt, so the node strips those tags and
   sends them as the structured `lora` field instead; repeated tags for the
-  same file sum their strengths.
+  same file sum their strengths. Names are expanded to the full filenames
+  (`name.sdcpp.safetensors`, not just the one-extension-stripped stem) that
+  the server uses to index its LoRA cache.
 - **Sigma presets do not exist on the server.** The schedule has to be a list
   of numbers. A preset name (`minimax-h3-image`) sends that workflow back to
   the spawn path.
@@ -180,6 +184,14 @@ Differences worth knowing:
 A resident server holds VRAM, so the model is unloaded once the machine goes
 idle (`SDCPP_SERVER_IDLE_MINUTES`); the process stays up, the card is free
 again, and the next render reloads the model.
+
+Only one server is created per host/port. Creation is serialized across ComfyUI
+processes and a per-user PID registry records the model context. A new ComfyUI
+process adopts a registered server whose parent exited; matching workflows do
+not reload the model and mismatched workflows reuse it by stopping and
+restarting that single process. A live parent keeps control of its own server,
+and an unrelated process on the configured port is never killed. Server mode
+does not require `sd-cli` unless a render actually falls back to standalone.
 
 ### Randomizing parts of the prompt
 
@@ -283,7 +295,14 @@ tower (the combined Qwen3-VL GGUF) does the job on its own.
 
 ```sh
 ./venv/bin/python custom_nodes/ComfyUI-SDCPP/tests/test_node_schema.py
+./venv/bin/python custom_nodes/ComfyUI-SDCPP/tests/test_sdserver_integration.py
 ```
+
+The integration tests use a fake HTTP server for lifecycle, cancellation and
+request handling, plus a real (tiny) fake CLI executable to exercise process
+creation, output decoding, `PATH` lookup and argument duplication. They do not
+load model weights. Real-engine smoke testing should cover both `SDCPP_MODE`
+values after changing the supported request or process arguments.
 
 The test pins the input names of every node and the order of the widget
 values. ComfyUI hands the inputs to a node by name and saves the widget

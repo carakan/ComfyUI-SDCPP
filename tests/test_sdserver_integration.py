@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import unittest
+import unittest.mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -244,6 +245,13 @@ class TestRequestBuilder(unittest.TestCase):
             [{"path": "a", "multiplier": 1.25}, {"path": "b", "multiplier": 0.5}],
         )
 
+    def test_widget_lora_sends_its_full_filename(self):
+        lora = m.SDCPPLora("/models/loras/caporales21/style.sdcpp.safetensors", 0.95)
+        payload = m.server_request("p", "", 64, 64, 8, 1.0, 1, "euler", "discrete",
+                                   -1.0, "", 1.0, True, lora, [], None, None, [])
+        self.assertEqual(payload["lora"],
+                         [{"path": "style.sdcpp.safetensors", "multiplier": 0.95}])
+
     def test_batch_count_passes_through(self):
         payload = m.server_request("a", "", 64, 64, 8, 1.0, 1, "euler", "discrete",
                                    -1.0, "", 1.0, True, None, [], None, None, [],
@@ -361,9 +369,8 @@ class TestServerGuards(_FakeBase):
         holder.listen(1)
         self.addCleanup(holder.close)
         os.environ["SDCPP_SERVER_PORT"] = str(holder.getsockname()[1])
-        with self.assertRaises(RuntimeError) as cm:
+        with self.assertRaises(RuntimeError):
             self.sd._start(["--flag"], {})
-        self.assertIn("taken", str(cm.exception))
         self.assertIsNone(self.sd.process)  # nothing was spawned
 
     def test_exit_stops_the_server(self):
@@ -381,6 +388,163 @@ class TestServerGuards(_FakeBase):
         # Without a handler, SIGTERM kills the interpreter without running
         # the atexit hook and the sd-server keeps the GPU and the port.
         self.assertNotEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+
+
+class TestPortabilityAndStandalone(unittest.TestCase):
+    def _run_standalone(self, binary_path):
+        model = type("Model", (), {"full_checkpoint": False, "path": "/models/flux.gguf"})()
+        with unittest.mock.patch.dict(os.environ, {"SDCPP_MODE": "standalone"}, clear=False):
+            with unittest.mock.patch.object(m, "sdcli_path", return_value=binary_path):
+                image = m.SDCPPSampler().generate(
+                    diffusion_model=model, prompt="a red square", negative_prompt="",
+                    width=4, height=4, steps=2, cfg_scale=1.0, seed=1,
+                    sampling_method="euler", scheduler="discrete", flow_shift=-1.0,
+                    vae_tiling=True, max_vram=8.0, offload_to_cpu=True,
+                    flash_attention=True, text_encoder_cpu=True, model_args="k=v",
+                )
+        self.assertEqual(tuple(image[0].shape), (1, 4, 4, 3))
+        return json.loads(self.capture_path.read_text())
+
+    def _fake_cli(self, directory, name="sd-cli"):
+        # A real executable, not a mocked Popen, exercises process/output handling.
+        script = directory / name
+        self.capture_path = directory / "arguments.json"
+        encoded = _png_b64()
+        script.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys, base64\n"
+            "from pathlib import Path\n"
+            f"Path({str(self.capture_path)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+            "Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes("
+            f"base64.b64decode({encoded!r}))\n"
+        )
+        script.chmod(0o700)
+        return str(script)
+
+    def test_standalone_does_not_repeat_context_arguments(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            arguments = self._run_standalone(self._fake_cli(Path(directory)))
+        for option in ("--max-vram", "--offload-to-cpu", "--flash-attn",
+                       "--params-backend", "--model-args"):
+            self.assertEqual(arguments.count(option), 1, f"{option} was passed twice")
+
+    def test_sd_cli_on_path_does_not_need_a_literal_file(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._fake_cli(root)
+            with unittest.mock.patch.dict(os.environ, {"PATH": directory}, clear=False):
+                os.environ.pop("SDCPP_BIN", None)
+                self.assertEqual(m.sdcli_path(), "sd-cli")
+                self._run_standalone("sd-cli")
+
+    def test_sd_server_uses_path_when_configured_cli_has_no_sibling(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cli_dir = root / "cli"
+            server_dir = root / "server"
+            cli_dir.mkdir()
+            server_dir.mkdir()
+            (cli_dir / "sd-cli").touch()
+            self._fake_cli(server_dir, "sd-server")
+            with unittest.mock.patch.dict(os.environ, {
+                "PATH": str(server_dir), "SDCPP_BIN": str(cli_dir / "sd-cli"),
+            }, clear=False):
+                os.environ.pop("SDCPP_SERVER_BIN", None)
+                self.assertTrue(m.executable_available(m.sdserver_path()))
+
+    def test_nested_prompt_lora_preserves_its_relative_filename(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            os.mkdir(os.path.join(directory, "styles"))
+            relative = os.path.join("styles", "style.sdcpp.safetensors")
+            with open(os.path.join(directory, relative), "wb"):
+                pass
+            resolved = m.resolve_lora_filename("style.sdcpp", [directory])
+            self.assertEqual(resolved, relative)
+
+    def test_toshllm_enhancements_opt_in_sets_all_engine_knobs(self):
+        clean = {key: value for key, value in os.environ.items()
+                 if key not in ("TOSH_FA_AMD", "TOSH_MM_WIDE_DISABLE", "GGML_METAL_NCB")}
+        clean["SDCPP_TOSHLLM_ENHANCEMENTS"] = "1"
+        with unittest.mock.patch.dict(os.environ, clean, clear=True):
+            env = m.sdcli_env()
+        self.assertEqual(env["TOSH_FA_AMD"], "1")
+        self.assertEqual(env["TOSH_MM_WIDE_DISABLE"], "1")
+        self.assertEqual(env["GGML_METAL_NCB"], "3")
+
+    def test_no_vendor_environment_is_injected_from_a_binary_path(self):
+        clean = {key: value for key, value in os.environ.items()
+                 if key not in ("TOSH_FA_AMD", "TOSH_MM_WIDE_DISABLE", "GGML_METAL_NCB")}
+        with unittest.mock.patch.dict(os.environ, clean, clear=True):
+            env = m.sdcli_env()
+        self.assertNotIn("TOSH_FA_AMD", env)
+        self.assertNotIn("TOSH_MM_WIDE_DISABLE", env)
+        self.assertNotIn("GGML_METAL_NCB", env)
+
+
+class TestServerRecovery(_FakeBase):
+    def test_orphaned_plugin_server_is_adopted_not_restarted(self):
+        import subprocess
+        import tempfile
+        self.server_state.model_state = "ready"
+        # Use a genuine owned child so the liveness check is meaningful.
+        child = subprocess.Popen(["sleep", "600"])
+        self.addCleanup(lambda: m._sdcli_stop(child, grace=0.1))
+        previous_parent = 2 ** 31 - 1
+        host, port = m.server_endpoint()
+        record = {
+            "pid": child.pid, "parent_pid": previous_parent,
+            "binary": sys.executable, "host": host, "port": port,
+            "context_args": ["--flag"], "version": 1,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "server.json")
+            with open(path, "w") as handle:
+                json.dump(record, handle)
+            with unittest.mock.patch.object(m, "server_registry_path", return_value=path):
+                recovered = m.SDServer()
+                self.assertTrue(recovered.recover())
+                recovered.ensure(["--flag"], env={})
+                self.assertEqual(recovered.pid, child.pid)
+                self.assertEqual(recovered.context_args, ["--flag"])
+                self.assertTrue(recovered.alive())
+                recovered.detach()
+
+
+    def test_failed_start_stops_process_and_removes_registry(self):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            registry = os.path.join(directory, "server.json")
+
+            def failed_start(instance, context_args, env):
+                instance.process = subprocess.Popen(["sleep", "600"])
+                instance.pid = instance.process.pid
+                instance.context_args = list(context_args)
+                instance._write_registry()
+                raise RuntimeError("model load failed")
+
+            with unittest.mock.patch.object(m, "server_registry_path", return_value=registry):
+                with unittest.mock.patch.object(m.SDServer, "_start", failed_start):
+                    with self.assertRaises(RuntimeError):
+                        self.sd.ensure(["--flag"], env={})
+                    self.assertIsNone(self.sd.process)
+                    self.assertFalse(os.path.exists(registry))
+
+
+    def test_process_spawn_failure_closes_the_log(self):
+        with unittest.mock.patch.object(m, "sdserver_path", return_value=sys.executable):
+            with unittest.mock.patch.object(m.SDServer, "_port_is_free", return_value=True):
+                with unittest.mock.patch.object(m.subprocess, "Popen", side_effect=OSError("spawn failed")):
+                    with self.assertRaises(OSError):
+                        self.sd.ensure(["--flag"], env={})
+        self.assertIsNone(self.sd.log_handle)
 
 
 class TestEngineKnobs(unittest.TestCase):

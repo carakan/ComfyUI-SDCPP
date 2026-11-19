@@ -277,10 +277,9 @@ class SDCppCustomFlux:
 # compiled stable-diffusion.cpp `sd-cli` binary instead: no Python bindings, no
 # build step, and it runs the exact build you already have on the machine.
 #
-# The binary is looked up in this order:
-#   1. $SDCPP_BIN
-#   2. /Applications/ToshLLM.app/Contents/Resources/bin-image/sd-cli
-#   3. sd-cli on $PATH
+# The binary is $SDCPP_BIN when set, otherwise sd-cli on $PATH. The server
+# defaults to $SDCPP_SERVER_BIN, then the sd-server next to sd-cli, then PATH.
+# This works with any OS and any stock or patched stable-diffusion.cpp build.
 #
 # Models are searched in ComfyUI's own model folders plus $SDCPP_MODEL_DIRS
 # (default: ~/models/imagen).
@@ -288,8 +287,8 @@ class SDCppCustomFlux:
 
 import json
 import io
-import platform
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -322,8 +321,6 @@ def _sdcli_stop(process, grace=15.0):
     except OSError:
         pass
 
-SDCLI_FALLBACK = "/Applications/ToshLLM.app/Contents/Resources/bin-image/sd-cli"
-
 MODEL_EXTENSIONS = (".gguf", ".safetensors", ".sft")
 TOKENIZER_EXTENSIONS = (".json",)
 
@@ -353,34 +350,18 @@ SCHEDULERS = [
 
 
 def sdcli_path():
-    configured = os.environ.get("SDCPP_BIN")
-    if configured:
-        return configured
-    if os.path.isfile(SDCLI_FALLBACK):
-        return SDCLI_FALLBACK
-    return "sd-cli"
+    return os.environ.get("SDCPP_BIN", "sd-cli")
 
-def sdcli_env(binary=None):
-    """Env for the sd-cli / sd-server subprocess.
 
-    The ToshLLM engine build on macOS Intel (AMD over Metal):
-    - TOSH_FA_AMD=1 routes flash attention to the _amd kernels - essential
-      when --flash-attn is on.
-    - TOSH_MM_WIDE_DISABLE=1 turns off the wide matmul tile; it is LLM-tuned
-      and costs on diffusion.
-    - GGML_METAL_NCB=3 splits Metal command buffers so big canvases stay
-      under the GPU watchdog.
-
-    The knobs apply to the ToshLLM build of *either* binary. Callers pass the
-    binary that is being launched, otherwise the check keys off the CLI path.
-    """
+def sdcli_env():
+    """Environment for both engine modes, with explicit opt-in vendor tuning."""
     env = dict(os.environ)
-    binary = binary or sdcli_path()
-    if (sys.platform == "darwin" and platform.machine() == "x86_64"
-            and "toshllm" in binary.lower()):
-        env["TOSH_FA_AMD"] = "1"
-        env["TOSH_MM_WIDE_DISABLE"] = "1"
-        env["GGML_METAL_NCB"] = "3"
+    if os.environ.get("SDCPP_TOSHLLM_ENHANCEMENTS", "").strip().lower() in {
+            "1", "true", "yes", "on"}:
+        # setdefault keeps deliberate per-variable overrides effective.
+        env.setdefault("TOSH_FA_AMD", "1")
+        env.setdefault("TOSH_MM_WIDE_DISABLE", "1")
+        env.setdefault("GGML_METAL_NCB", "3")
     return env
 
 
@@ -392,9 +373,9 @@ def sdcli_env(binary=None):
 # process alive and renders through its native async API, so the model stays
 # resident and the second render of a workflow starts sampling right away.
 #
-# The mode is a process environment switch, read once at import:
+# The mode is selected for each render so the documented setting is explicit:
 #
-#   SDCPP_MODE=standalone   spawn sd-cli per render (default, unchanged)
+#   SDCPP_MODE=standalone   spawn sd-cli per render (default)
 #   SDCPP_MODE=server       keep one sd-server alive and render through it
 #
 # Other knobs (all optional):
@@ -413,13 +394,13 @@ def sdcli_env(binary=None):
 # =============================================================================
 
 import base64
+import contextlib
+import hashlib
 import urllib.error
 import atexit
 import signal
 import socket
 import urllib.request
-
-SDSERVER_FALLBACK = "/Applications/ToshLLM.app/Contents/Resources/bin-image/sd-server"
 
 _server = None
 
@@ -433,12 +414,18 @@ def sdserver_path():
     configured = os.environ.get("SDCPP_SERVER_BIN")
     if configured:
         return configured
-    sibling = os.path.join(os.path.dirname(sdcli_path()), "sd-server")
-    if os.path.isfile(sibling):
-        return sibling
-    if os.path.isfile(SDSERVER_FALLBACK):
-        return SDSERVER_FALLBACK
-    return "sd-server"
+    cli = sdcli_path()
+    name = "sd-server.exe" if cli.lower().endswith(".exe") else "sd-server"
+    if os.path.dirname(cli):
+        sibling = os.path.join(os.path.dirname(cli), name)
+        if shutil.which(sibling):
+            return sibling
+    return name
+
+
+def executable_available(binary):
+    """Support explicit paths and normal PATH lookup on every OS."""
+    return shutil.which(binary) is not None
 
 
 def server_endpoint():
@@ -471,6 +458,102 @@ def b64_images(tensors):
     return [_b64_png(t) for t in tensors]
 
 
+def server_registry_path():
+    """Per-user endpoint registry used to recover a server after a restart."""
+    host, port = server_endpoint()
+    key = hashlib.sha256(f"{host}\0{port}".encode("utf-8")).hexdigest()[:16]
+    try:
+        owner = str(os.getuid())
+    except AttributeError:
+        owner = "user"
+    directory = os.path.join(tempfile.gettempdir(), f"comfyui-sdcpp-{owner}")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    return os.path.join(directory, f"server-{key}.json")
+
+
+def _pid_alive(pid):
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+    # os.kill(pid, 0) has console-control semantics on Windows, not POSIX
+    # liveness semantics. Use a query-only process handle instead.
+    import ctypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if handle:
+        kernel32.CloseHandle(handle)
+        return True
+    # Access denied still proves that the PID exists.
+    return ctypes.get_last_error() == 5
+
+
+class _AttachedProcess:
+    """Minimal Popen-compatible handle for a recovered plugin-owned server."""
+
+    def __init__(self, pid):
+        self.pid = pid
+        self.returncode = None
+        self.stdout = None
+
+    def poll(self):
+        if self.returncode is None and not _pid_alive(self.pid):
+            self.returncode = -signal.SIGTERM
+        return self.returncode
+
+    def wait(self, timeout=None):
+        deadline = time.monotonic() + (timeout if timeout is not None else 2 ** 31)
+        while self.poll() is None:
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self.pid, timeout)
+            time.sleep(0.1)
+        return self.returncode
+
+    def terminate(self):
+        os.kill(self.pid, signal.SIGTERM)
+
+    def kill(self):
+        os.kill(self.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+
+
+@contextlib.contextmanager
+def _server_process_lock():
+    """Serialize server creation across separate ComfyUI processes."""
+    path = server_registry_path() + ".lock"
+    with open(path, "a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 class SDServer:
     """One sd-server process, driven through its native async API.
 
@@ -486,6 +569,7 @@ class SDServer:
 
     def __init__(self):
         self.process = None
+        self.pid = None
         self.context_args = []
         self.idle_thread = None
         self.log_handle = None
@@ -534,20 +618,95 @@ class SDServer:
             return None
         return payload if status == 200 else None
 
+    def _read_registry(self):
+        try:
+            with open(server_registry_path(), encoding="utf-8") as handle:
+                record = json.load(handle)
+            host, port = server_endpoint()
+            if record.get("version") != 1 or record.get("host") != host or record.get("port") != port:
+                return None
+            if not isinstance(record.get("pid"), int) or not isinstance(record.get("parent_pid"), int):
+                return None
+            if not isinstance(record.get("context_args"), list):
+                return None
+            return record
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _write_registry(self):
+        if self.process is None or self.pid is None:
+            return
+        host, port = server_endpoint()
+        record = {
+            "version": 1, "pid": self.pid, "parent_pid": os.getpid(),
+            "binary": sdserver_path(), "host": host, "port": port,
+            "context_args": list(self.context_args),
+        }
+        path = server_registry_path()
+        temporary = f"{path}.{os.getpid()}.tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(record, handle)
+        os.replace(temporary, path)
+
+    def _remove_registry(self):
+        record = self._read_registry()
+        if record is not None and record.get("pid") != self.pid:
+            return
+        try:
+            os.remove(server_registry_path())
+        except OSError:
+            pass
+
+    def recover(self):
+        """Adopt only a per-user, plugin-registered orphan, never a foreign server.
+
+        A still-running ComfyUI parent retains sole control of its server.
+        After a crash (or a plugin reload), the same process or a new ComfyUI
+        process can adopt the registered model instead of launching a duplicate.
+        """
+        if self.alive():
+            return True
+        record = self._read_registry()
+        if record is None or not _pid_alive(record["pid"]):
+            return False
+        parent = record["parent_pid"]
+        if parent != os.getpid() and _pid_alive(parent):
+            return False
+        status = self._status()
+        if status is None:
+            return False
+        self.process = _AttachedProcess(record["pid"])
+        self.pid = record["pid"]
+        self.context_args = list(record["context_args"])
+        self._pending_args = list(self.context_args)
+        self.model_loaded = status.get("state") in ("ready", "loading")
+        self.last_used = time.time()
+        self._log(f"recovered orphaned server pid {self.pid}")
+        self._start_idle_watch()
+        return True
+
+    def detach(self):
+        """Release a local handle without stopping a recovered server."""
+        self.process = None
+        self.pid = None
+
     def stop(self):
         with self.lock:
             if self.process is None:
+                if self.log_handle is not None:
+                    self.log_handle.close()
+                    self.log_handle = None
                 return
-            self._log("stopping the server")
+            pid = self.pid if self.pid is not None else self.process.pid
+            self._log(f"stopping server pid {pid}")
             _sdcli_stop(self.process)
+            self._remove_registry()
             self.process = None
+            self.pid = None
             self.model_loaded = False
             self.context_args = []
-            if getattr(self, "log_handle", None) is not None:
-                try:
-                    self.log_handle.close()
-                except OSError:
-                    pass
+            if self.log_handle is not None:
+                self.log_handle.close()
                 self.log_handle = None
 
     def _wait_ready(self, timeout=600):
@@ -587,15 +746,16 @@ class SDServer:
 
     def _start(self, context_args, env):
         binary = sdserver_path()
-        if not os.path.isfile(binary):
+        if not executable_available(binary):
             raise FileNotFoundError(
-                f"sd-server not found at {binary}. Set SDCPP_SERVER_BIN to a stable-diffusion.cpp server build."
+                f"sd-server not found at {binary}. Set SDCPP_SERVER_BIN or add sd-server to PATH."
             )
+        binary = shutil.which(binary) or binary
         host, port = server_endpoint()
         if not self._port_is_free(host, port):
             raise RuntimeError(
-                f"port {port} is taken by another process. A second sd-server on the same "
-                "port answers with the wrong model, so the server path is skipped."
+                f"port {port} belongs to an unmanaged or actively-owned server; "
+                "using standalone mode for this render"
             )
         cmd = [
             binary,
@@ -604,38 +764,44 @@ class SDServer:
             "--log-level", os.environ.get("SDCPP_SERVER_LOG_LEVEL", "warn"),
             "--conditioning-cache-size", os.environ.get("SDCPP_SERVER_CONDITIONING_CACHE", "8"),
         ]
-        # Let sd-server resolve LoRA stems from its own model roots.
-        for path in sorted({p for p in os.environ.get("SDCPP_MODEL_DIRS", os.path.expanduser("~/models/imagen")).split(os.pathsep) if p}):
+        for path in extra_model_dirs():
             cmd += ["--model-dir", path]
         cmd += context_args
         self._log(f"starting: {' '.join(cmd)}")
         self.log_path = os.path.join(tempfile.gettempdir(), "sdcpp-sd-server.log")
-        self.log_handle = open(self.log_path, "w")
+        self.log_handle = open(self.log_path, "w", encoding="utf-8")
         self.process = subprocess.Popen(cmd, stdout=self.log_handle, stderr=subprocess.STDOUT,
                                         text=True, env=env)
+        self.pid = self.process.pid
+        self.context_args = list(context_args)
         self._pending_args = list(context_args)
+        self._write_registry()
         self._start_idle_watch()
         self._wait_ready()
 
     def ensure(self, context_args, env):
-        """Reuse the running server only when the loaded model matches."""
-        with self.lock:
-            if self.alive() and self.model_loaded and self.context_args == list(context_args):
-                # Cheap re-confirmation: the idler may have unloaded between renders.
+        """Reuse the running server only when the loaded context matches."""
+        with self.lock, _server_process_lock():
+            if not self.alive():
+                self.stop()
+                self.recover()
+            if self.alive() and self.context_args == list(context_args):
                 status = self._status()
-                if status and status.get("state") in ("ready", "loading"):
-                    if status.get("state") == "ready":
-                        self.last_used = time.time()
-                        return True
-            if self.alive() and self.model_loaded:
-                status = self._status()
-                if status and status.get("state") == "empty":
-                    # Idler already unloaded the old context; nothing to stop.
-                    self.stop()
-                else:
-                    self.stop()
-            self._start(context_args, env)
-            self._start_idle_watch()
+                if status and status.get("state") == "ready":
+                    self.model_loaded = True
+                    self.last_used = time.time()
+                    return True
+                if status and status.get("state") == "loading":
+                    self._wait_ready()
+                    return True
+            self.stop()
+            try:
+                self._start(context_args, env)
+            except Exception:
+                # A model-load error must not leave the failed process and
+                # registry behind to block every later server render.
+                self.stop()
+                raise
             return True
 
     def _start_idle_watch(self):
@@ -654,7 +820,8 @@ class SDServer:
                             continue
                         if time.time() - self.last_used < minutes * 60:
                             continue
-                        if self._status() and self._status().get("state") == "empty":
+                        status = self._status()
+                        if not status or status.get("state") != "ready":
                             continue
                         self._log("idle: unloading the model to free VRAM")
                         status, payload = self._http("POST", "/sdcpp/v1/models/unload", {}, timeout=30)
@@ -674,18 +841,24 @@ class SDServer:
     # -- render ------------------------------------------------------------
     def render(self, body, steps, timeout=3600):
         """Submit a generation and wait for it. Cancellations cancel the job."""
-        status, payload = self._http("POST", "/sdcpp/v1/img_gen", body, timeout=60)
-        if status not in (200, 202):
-            message = payload.get("error", payload) if isinstance(payload, dict) else payload
-            raise RuntimeError(f"sd-server refused the request ({status}): {message}")
-        job_id = payload.get("id")
-        if not job_id:
-            raise RuntimeError(f"sd-server returned no job id: {payload}")
+        with self.lock:
+            self.in_flight += 1
+            self.last_used = time.time()
+            try:
+                status, payload = self._http("POST", "/sdcpp/v1/img_gen", body, timeout=60)
+                if status not in (200, 202):
+                    message = payload.get("error", payload) if isinstance(payload, dict) else payload
+                    raise RuntimeError(f"sd-server refused the request ({status}): {message}")
+                job_id = payload.get("id")
+                if not job_id:
+                    raise RuntimeError(f"sd-server returned no job id: {payload}")
+            except BaseException:
+                self.in_flight -= 1
+                self.last_used = time.time()
+                raise
 
         progress = comfy.utils.ProgressBar(steps)
         deadline = time.time() + timeout
-        self.in_flight += 1
-        self.last_used = time.time()
         try:
             while time.time() < deadline:
                 try:
@@ -741,6 +914,7 @@ def get_server():
     global _server
     if _server is None:
         _server = SDServer()
+        _server.recover()
     return _server
 
 
@@ -821,8 +995,8 @@ def model_context_args(diffusion_model, vae, tokenizer, encoders, vision_encoder
                        text_encoder_cpu=True, model_args=""):
     """The model context flags, shared by the spawn path and the server start.
 
-    The server receives the same placement/performance knobs as sd-cli, so the
-    resident engine behaves identically to a one-shot render on this Mac.
+    Both execution paths receive the same standard sd.cpp model, placement and
+    performance arguments; neither path is specialized for one GPU or OS.
     """
     args = []
     if diffusion_model.full_checkpoint:
@@ -866,6 +1040,36 @@ def save_image_tensors(tensors, workdir, prefix):
         Image.fromarray(array).save(path)
         paths.append(path)
     return paths
+
+
+def resolve_lora_filename(name, extra_dirs=()):
+    """Map a LoRA name to the full filename the sd-server's cache is indexed by.
+
+    The server matches request entries against the file's name relative to its
+    scan root ("caporales_qwen_image_21_v2.sdcpp.safetensors"), while prompts and
+    widgets naturally carry the stem ("caporales_qwen_image_21_v2.sdcpp", one
+    extension stripped). A stem that lost only ".safetensors" never matches, the
+    resolver returns "" and the request dies with 400 invalid generation
+    parameters — so expand stems back to real files before sending them.
+    """
+    model_exts = (".safetensors", ".sft", ".ckpt", ".gguf", ".bin", ".pt")
+    lowered = name.lower()
+    if lowered.endswith(model_exts):
+        return name
+    candidates = list(extra_dirs)
+    try:
+        candidates += folder_paths.get_folder_paths("loras")
+    except Exception:
+        pass
+    for directory in candidates:
+        if not directory or not os.path.isdir(directory):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(directory):
+            for filename in filenames:
+                lowered_file = filename.lower()
+                if lowered_file.startswith(lowered + ".") and lowered_file.endswith(model_exts):
+                    return os.path.relpath(os.path.join(dirpath, filename), directory)
+    return name
 
 
 def merge_lora_entries(entries):
@@ -921,10 +1125,14 @@ def server_request(prompt, negative_prompt, width, height, steps, cfg_scale, see
         body["sample_params"]["custom_sigmas"] = values
     loras = []
     if lora is not None:
-        loras.append((lora.stem, lora.strength))
+        # The server's cache is indexed by the full filename, not the stem.
+        loras.append((lora.name, lora.strength))
     loras.extend(prompt_loras)
     if loras:
-        body["lora"] = merge_lora_entries(loras)
+        widget_dir = os.path.dirname(lora.path) if lora is not None else None
+        resolved = [(resolve_lora_filename(name, [widget_dir] if widget_dir else ()), strength)
+                    for name, strength in loras]
+        body["lora"] = merge_lora_entries(resolved)
     if vae_tiling:
         body["vae_tiling_params"] = {"enabled": True}
     if batch_count is not None:
@@ -1110,7 +1318,8 @@ class SDCPPLora:
     def __init__(self, path, strength):
         self.path = path
         self.strength = strength
-        self.stem = os.path.splitext(os.path.basename(path))[0]
+        self.name = os.path.basename(path)
+        self.stem = os.path.splitext(self.name)[0]
 
 
 class SDCPPLoraLoader:
@@ -1303,15 +1512,15 @@ class SDCPPSampler:
         clean_prompt, prompt_loras = split_lora_tags(prompt)
 
         comfy.model_management.throw_exception_if_processing_interrupted()
-        # ensure() serialises startup/teardown through its own lock; the GPU
-        # is only contended during the launch window, not for the whole render.
-        server.ensure(context_args, sdcli_env(sdserver_path()))
-
+        # Build and validate the request before an expensive model reload.
         body = server_request(clean_prompt, negative_prompt, width, height, steps,
                               cfg_scale, seed, sampling_method, scheduler, flow_shift,
                               sigmas, strength, vae_tiling, lora, prompt_loras,
                               None, reference_image_4, references)
-        images = server.render(body, steps)
+        # Different workflows must not replace the model under an active job.
+        with server.generation_lock:
+            server.ensure(context_args, sdcli_env())
+            images = server.render(body, steps)
         out = []
         for raw in images:
             array = np.asarray(raw.convert("RGB")).astype(np.float32) / 255.0
@@ -1342,9 +1551,9 @@ class SDCPPSampler:
                 prompt = expanded
 
         binary = sdcli_path()
-        if not os.path.isfile(binary):
+        if not server_mode_enabled() and not executable_available(binary):
             raise FileNotFoundError(
-                f"sd-cli not found at {binary}. Set SDCPP_BIN to a stable-diffusion.cpp build."
+                f"sd-cli not found at {binary}. Set SDCPP_BIN or add sd-cli to PATH."
             )
 
         encoders = [encoder for encoder in (text_encoder, text_encoder_2) if encoder is not None]
@@ -1369,9 +1578,9 @@ class SDCPPSampler:
             if torch.backends.mps.is_available():
                 # sd-cli can only use what the driver still shows free; these two
                 # numbers say whether ComfyUI itself is the process holding it.
-                print(f"[sd-cli] MPS after release: tensors {torch.mps.current_allocated_memory() / 2**20:.0f} MB, driver {torch.mps.driver_allocated_memory() / 2**20:.0f} MB")
+                print(f"[sdcpp] MPS after release: tensors {torch.mps.current_allocated_memory() / 2**20:.0f} MB, driver {torch.mps.driver_allocated_memory() / 2**20:.0f} MB")
         except Exception as error:
-            print(f"[sd-cli] could not release the torch GPU cache: {error}")
+            print(f"[sdcpp] could not release the torch GPU cache: {error}")
 
         if server_mode_enabled():
             try:
@@ -1385,6 +1594,11 @@ class SDCPPSampler:
                 # failure goes back to the spawn path.
                 print(f"[sd-server] server path failed, falling back to sd-cli: {error}")
 
+        if not executable_available(binary):
+            raise FileNotFoundError(
+                f"sd-cli not found at {binary}. Set SDCPP_BIN or add sd-cli to PATH."
+            )
+        binary = shutil.which(binary) or binary
         with tempfile.TemporaryDirectory() as workdir:
             output = os.path.join(workdir, "out.png")
             cmd = [binary]
@@ -1408,20 +1622,8 @@ class SDCPPSampler:
                 # Distilled schedules (Qwen-Image Turbo) are lists of sigmas, not
                 # a scheduler name; sd.cpp takes them verbatim.
                 cmd += ["--sigmas", sigmas.strip()]
-            if model_args.strip():
-                cmd += ["--model-args", model_args.strip()]
             if vae_tiling:
                 cmd += ["--vae-tiling"]
-            if max_vram > 0:
-                cmd += ["--max-vram", str(max_vram)]
-            if offload_to_cpu:
-                cmd += ["--offload-to-cpu"]
-            if flash_attention:
-                cmd += ["--flash-attn", "off,diffusion=on"]
-            if text_encoder_cpu:
-                # Encode on the CPU: the encoder never sits in VRAM, leaving
-                # more of the card to the diffusion model and LoRAs.
-                cmd += ["--params-backend", "te=cpu"]
             if reference_image_4 is not None:
                 input_path = save_image_tensors([reference_image_4[0]], workdir, "input")[0]
                 cmd += ["-i", input_path, "--strength", str(strength)]
@@ -1473,6 +1675,7 @@ class SDCPPSampler:
                     # its render. terminate first so Metal can clean up, kill if
                     # it ignores that.
                     _sdcli_stop(proc)
+                    proc.stdout.close()
                     _sdcli_process = None
                 if proc.returncode != 0 or not os.path.isfile(output):
                     raise RuntimeError("sd-cli failed:\n" + "\n".join(lines[-20:]))
